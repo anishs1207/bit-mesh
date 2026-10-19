@@ -1,5 +1,19 @@
-/prompts
+# Private implementation briefs and progress notes
+/prompts/
+/promps/
 
-# Added by cargo
+# Rust and Anchor build output at any workspace depth
+target/
+**/target/
 
-/target
+# Local BitMesh node state and common demo data directories
+/.bitmesh/
+/node-*/
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.log
