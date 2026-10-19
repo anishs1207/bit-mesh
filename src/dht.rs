@@ -1,4 +1,4 @@
-use crate::manifest::{ContentId, hash_bytes};
+use crate::manifest::ContentId;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -19,9 +19,7 @@ pub struct Peer {
 impl Peer {
     pub fn from_address(address: SocketAddr, capacity_bytes: u64) -> Self {
         Self {
-            id: hash_bytes(address.to_string().as_bytes()).as_bytes()[..32]
-                .try_into()
-                .unwrap(),
+            id: sha2_bytes(address.to_string().as_bytes()),
             address,
             relay: None,
             capacity_bytes,
@@ -103,5 +101,14 @@ mod tests {
         d.add_peer(a);
         d.add_peer(b.clone());
         assert_eq!(d.closest(&[0; 32])[0], b);
+    }
+
+    #[test]
+    fn address_ids_are_binary_sha256_values() {
+        let address = "127.0.0.1:7400".parse().unwrap();
+        assert_eq!(
+            Peer::from_address(address, 1).id,
+            sha2_bytes(b"127.0.0.1:7400")
+        );
     }
 }

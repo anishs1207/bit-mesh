@@ -1,4 +1,4 @@
-use crate::manifest::{ContentId, Manifest, hash_bytes};
+use crate::manifest::{ContentId, Manifest, hash_bytes, validate_content_id};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -6,6 +6,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -32,9 +33,7 @@ impl Store {
         Ok(Self { root, quota })
     }
     fn checked_id(id: &str) -> Result<&str> {
-        if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            bail!("invalid content id");
-        }
+        validate_content_id(id)?;
         Ok(id)
     }
     pub fn chunk_path(&self, id: &str) -> Result<PathBuf> {
@@ -73,6 +72,7 @@ impl Store {
         self.chunk_path(id).is_ok_and(|p| p.exists())
     }
     pub fn put_manifest(&self, manifest: &Manifest) -> Result<ContentId> {
+        manifest.validate()?;
         let id = manifest.id()?;
         atomic_write(
             &self.root.join("manifests").join(&id),
@@ -83,6 +83,7 @@ impl Store {
     pub fn get_manifest(&self, id: &str) -> Result<Manifest> {
         let path = self.root.join("manifests").join(Self::checked_id(id)?);
         let manifest: Manifest = serde_json::from_slice(&fs::read(path)?)?;
+        manifest.validate()?;
         if manifest.id()? != id {
             bail!("manifest id mismatch");
         }
@@ -128,11 +129,24 @@ impl Store {
     }
 }
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut file = fs::File::create(&temp)?;
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    if path.exists() {
+        return Ok(());
+    }
+    let suffix = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("tmp-{}-{suffix}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    fs::rename(temp, path)?;
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        if !path.exists() {
+            return Err(error.into());
+        }
+    }
     Ok(())
 }
 

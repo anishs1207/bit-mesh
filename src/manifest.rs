@@ -10,6 +10,17 @@ use std::{
 
 pub type ContentId = String;
 
+pub fn validate_content_id(id: &str) -> Result<()> {
+    if id.len() != 64
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("content id must be a lowercase SHA-256 hex digest");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkRef {
     pub hash: ContentId,
@@ -81,6 +92,33 @@ impl Manifest {
         Ok(hash_bytes(&serde_json::to_vec(self)?))
     }
 
+    pub fn validate(&self) -> Result<()> {
+        if self.version != 1 {
+            bail!("unsupported manifest version {}", self.version);
+        }
+        if self.chunk_size == 0 {
+            bail!("chunk size must be greater than zero");
+        }
+        let mut total = 0u64;
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            validate_content_id(&chunk.hash)
+                .with_context(|| format!("invalid chunk id at index {index}"))?;
+            if chunk.size == 0 || chunk.size > self.chunk_size as u64 {
+                bail!("invalid chunk size at index {index}");
+            }
+            total = total
+                .checked_add(chunk.size)
+                .context("manifest size overflow")?;
+        }
+        if total != self.size {
+            bail!("manifest size is {}, but chunks total {total}", self.size);
+        }
+        if self.size == 0 && !self.chunks.is_empty() {
+            bail!("empty files cannot contain chunks");
+        }
+        Ok(())
+    }
+
     pub fn verify_chunk(&self, index: usize, bytes: &[u8]) -> bool {
         self.chunks
             .get(index)
@@ -110,5 +148,25 @@ mod tests {
         };
         assert!(m.verify_chunk(0, b"abc"));
         assert!(!m.verify_chunk(0, b"abd"));
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_malformed_manifest() {
+        let mut m = Manifest {
+            version: 1,
+            name: "x".into(),
+            size: 4,
+            chunk_size: 3,
+            chunks: vec![ChunkRef {
+                hash: hash_bytes(b"abc"),
+                size: 3,
+            }],
+            created_at: 0,
+        };
+        assert!(m.validate().is_err());
+        m.size = 3;
+        m.chunks[0].hash.make_ascii_uppercase();
+        assert!(m.validate().is_err());
     }
 }
