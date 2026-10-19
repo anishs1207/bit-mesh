@@ -36,8 +36,10 @@ fn distance(a: &NodeId, b: &NodeId) -> NodeId {
 }
 
 pub fn key_id(key: &str) -> NodeId {
-    let bytes = hex::decode(key).unwrap_or_else(|_| sha2_bytes(key.as_bytes()).to_vec());
-    sha2_bytes(&bytes)
+    match hex::decode(key) {
+        Ok(bytes) if bytes.len() == 32 => bytes.try_into().expect("length checked"),
+        _ => sha2_bytes(key.as_bytes()),
+    }
 }
 
 fn sha2_bytes(bytes: &[u8]) -> NodeId {
@@ -110,5 +112,11 @@ mod tests {
             Peer::from_address(address, 1).id,
             sha2_bytes(b"127.0.0.1:7400")
         );
+    }
+
+    #[test]
+    fn content_digest_is_its_own_dht_key() {
+        let digest = sha2_bytes(b"chunk");
+        assert_eq!(key_id(&hex::encode(digest)), digest);
     }
 }

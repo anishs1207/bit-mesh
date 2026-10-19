@@ -46,6 +46,13 @@ impl Store {
             .map(|m| m.len())
             .sum())
     }
+    pub fn quota(&self) -> u64 {
+        self.quota
+    }
+
+    pub fn available(&self) -> Result<u64> {
+        Ok(self.quota.saturating_sub(self.used()?))
+    }
     pub fn put_chunk(&self, expected: &str, bytes: &[u8]) -> Result<bool> {
         if hash_bytes(bytes) != expected {
             bail!("chunk hash mismatch");

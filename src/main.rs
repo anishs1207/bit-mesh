@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use bit_mesh::{
     DEFAULT_CHUNK_SIZE,
-    manifest::{Manifest, hash_bytes},
+    manifest::{ChunkRef, Manifest},
     network::{self, Request, Response},
     store::{Lease, Store},
 };
@@ -70,6 +70,10 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         peers: Vec<SocketAddr>,
     },
+    Status {
+        #[arg(long, value_delimiter = ',')]
+        peers: Vec<SocketAddr>,
+    },
     Gc,
 }
 
@@ -131,12 +135,21 @@ async fn main() -> Result<()> {
             peers,
         } => {
             let m = store.get_manifest(&manifest)?;
-            let chunks = m
-                .chunks
-                .iter()
-                .map(|c| store.get_chunk(&c.hash))
-                .collect::<Result<Vec<_>>>()?;
-            replicate(&m, &chunks, replication, &peers).await
+            repair(&store, &m, replication, &peers).await
+        }
+        Command::Status { peers } => {
+            println!("local: {} / {} bytes used", store.used()?, store.quota());
+            for peer in peers {
+                match network::request(peer, Request::Status).await {
+                    Ok(Response::Status(status)) => println!(
+                        "{peer}: {} / {} bytes used ({} available)",
+                        status.used_bytes, status.quota_bytes, status.available_bytes
+                    ),
+                    Ok(Response::Error(error)) => println!("{peer}: error: {error}"),
+                    _ => println!("{peer}: unavailable"),
+                }
+            }
+            Ok(())
         }
         Command::Gc => {
             let (count, bytes) = store.garbage_collect()?;
@@ -152,6 +165,9 @@ async fn replicate(
     desired: usize,
     peers: &[SocketAddr],
 ) -> Result<()> {
+    if desired == 0 {
+        bail!("replication must be at least one");
+    }
     if desired <= 1 {
         return Ok(());
     }
@@ -165,6 +181,16 @@ async fn replicate(
     for (chunk, bytes) in m.chunks.iter().zip(chunks) {
         let mut copies = 1;
         for peer in peers {
+            if matches!(
+                network::request(*peer, Request::HasChunk(chunk.hash.clone())).await,
+                Ok(Response::Present(true))
+            ) {
+                copies += 1;
+                if copies >= desired {
+                    break;
+                }
+                continue;
+            }
             if matches!(
                 network::request(*peer, Request::PutChunk(chunk.hash.clone(), bytes.clone())).await,
                 Ok(Response::Stored)
@@ -188,6 +214,95 @@ async fn replicate(
     Ok(())
 }
 
+async fn probe_sources(hash: &str, peers: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for peer in peers.iter().copied() {
+        let hash = hash.to_owned();
+        tasks.spawn(async move {
+            matches!(
+                network::request(peer, Request::HasChunk(hash)).await,
+                Ok(Response::Present(true))
+            )
+            .then_some(peer)
+        });
+    }
+    let mut sources = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        if let Ok(Some(peer)) = result {
+            sources.push(peer);
+        }
+    }
+    sources
+}
+
+async fn fetch_chunk(
+    store: &Store,
+    chunk: &ChunkRef,
+    peers: &[SocketAddr],
+    retries: usize,
+) -> Result<Vec<u8>> {
+    if let Ok(bytes) = store.get_chunk(&chunk.hash) {
+        if bytes.len() as u64 == chunk.size {
+            return Ok(bytes);
+        }
+    }
+    let sources = probe_sources(&chunk.hash, peers).await;
+    for peer in sources.iter().cycle().take(retries.max(1)) {
+        if let Ok(Response::Chunk(bytes)) =
+            network::request(*peer, Request::GetChunk(chunk.hash.clone())).await
+        {
+            if bytes.len() as u64 == chunk.size
+                && bit_mesh::manifest::hash_bytes(&bytes) == chunk.hash
+            {
+                store.put_chunk(&chunk.hash, &bytes)?;
+                return Ok(bytes);
+            }
+        }
+    }
+    bail!("chunk {} is unavailable from valid replicas", chunk.hash)
+}
+
+async fn repair(
+    store: &Store,
+    manifest: &Manifest,
+    desired: usize,
+    peers: &[SocketAddr],
+) -> Result<()> {
+    if desired == 0 {
+        bail!("replication must be at least one");
+    }
+    for chunk in &manifest.chunks {
+        let bytes = fetch_chunk(store, chunk, peers, peers.len().max(1)).await?;
+        let mut sources = probe_sources(&chunk.hash, peers).await;
+        let mut copies = 1 + sources.len();
+        for peer in peers {
+            if copies >= desired {
+                break;
+            }
+            if sources.contains(peer) {
+                continue;
+            }
+            if matches!(
+                network::request(*peer, Request::PutChunk(chunk.hash.clone(), bytes.clone())).await,
+                Ok(Response::Stored)
+            ) {
+                copies += 1;
+                sources.push(*peer);
+            }
+        }
+        if copies < desired {
+            bail!(
+                "chunk {} only has {copies}/{desired} confirmed replicas",
+                chunk.hash
+            );
+        }
+    }
+    for peer in peers {
+        let _ = network::request(*peer, Request::PutManifest(manifest.clone())).await;
+    }
+    Ok(())
+}
+
 async fn download(
     store: &Store,
     manifest_id: &str,
@@ -204,8 +319,10 @@ async fn download(
                 if let Ok(Response::Manifest(m)) =
                     network::request(*peer, Request::GetManifest(manifest_id.into())).await
                 {
-                    found = Some(m);
-                    break;
+                    if m.validate().is_ok() && m.id().is_ok_and(|id| id == manifest_id) {
+                        found = Some(m);
+                        break;
+                    }
                 }
             }
             found.context("manifest unavailable locally and from peers")?
@@ -214,10 +331,19 @@ async fn download(
     let sem = Arc::new(Semaphore::new(parallel.max(1)));
     let results = Arc::new(Mutex::new(HashMap::new()));
     let mut tasks = Vec::new();
+    let mut jobs = Vec::with_capacity(manifest.chunks.len());
     for (index, chunk) in manifest.chunks.iter().cloned().enumerate() {
+        let sources = if store.has_chunk(&chunk.hash) {
+            Vec::new()
+        } else {
+            probe_sources(&chunk.hash, peers).await
+        };
+        jobs.push((index, chunk, sources));
+    }
+    jobs.sort_by_key(|(_, _, sources)| sources.len());
+    for (index, chunk, sources) in jobs {
         let permit = sem.clone().acquire_owned().await?;
         let store = store.clone();
-        let peers = peers.to_vec();
         let results = results.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
@@ -225,15 +351,13 @@ async fn download(
                 Some(bytes)
             } else {
                 let mut value = None;
-                for attempt in 0..retries.max(1) {
-                    if peers.is_empty() {
-                        break;
-                    }
-                    let peer = peers[(index + attempt) % peers.len()];
+                for peer in sources.iter().cycle().take(retries.max(1)) {
                     if let Ok(Response::Chunk(bytes)) =
-                        network::request(peer, Request::GetChunk(chunk.hash.clone())).await
+                        network::request(*peer, Request::GetChunk(chunk.hash.clone())).await
                     {
-                        if hash_bytes(&bytes) == chunk.hash {
+                        if bytes.len() as u64 == chunk.size
+                            && bit_mesh::manifest::hash_bytes(&bytes) == chunk.hash
+                        {
                             value = Some(bytes);
                             break;
                         }

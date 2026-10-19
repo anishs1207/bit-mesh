@@ -9,7 +9,11 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Semaphore,
+    time::{Duration, timeout},
 };
+
+const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -18,7 +22,14 @@ pub enum Request {
     GetManifest(ContentId),
     PutChunk(ContentId, Vec<u8>),
     PutManifest(Manifest),
+    Status,
     Ping,
+}
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeStatus {
+    pub used_bytes: u64,
+    pub quota_bytes: u64,
+    pub available_bytes: u64,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
@@ -26,12 +37,13 @@ pub enum Response {
     Manifest(Manifest),
     Present(bool),
     Stored,
+    Status(NodeStatus),
     Pong,
     Error(String),
 }
 async fn send_frame(stream: &mut TcpStream, value: &impl Serialize) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
-    if bytes.len() > 64 * 1024 * 1024 {
+    if bytes.len() > MAX_FRAME_SIZE {
         bail!("frame too large");
     }
     stream.write_u32(bytes.len() as u32).await?;
@@ -40,7 +52,7 @@ async fn send_frame(stream: &mut TcpStream, value: &impl Serialize) -> Result<()
 }
 async fn recv_frame<T: for<'a> Deserialize<'a>>(stream: &mut TcpStream) -> Result<T> {
     let len = stream.read_u32().await? as usize;
-    if len > 64 * 1024 * 1024 {
+    if len > MAX_FRAME_SIZE {
         bail!("frame too large");
     }
     let mut bytes = vec![0; len];
@@ -48,11 +60,15 @@ async fn recv_frame<T: for<'a> Deserialize<'a>>(stream: &mut TcpStream) -> Resul
     Ok(serde_json::from_slice(&bytes)?)
 }
 pub async fn request(addr: SocketAddr, request: Request) -> Result<Response> {
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .with_context(|| format!("connect to {addr}"))?;
-    send_frame(&mut stream, &request).await?;
-    recv_frame(&mut stream).await
+    timeout(REQUEST_TIMEOUT, async {
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("connect to {addr}"))?;
+        send_frame(&mut stream, &request).await?;
+        recv_frame(&mut stream).await
+    })
+    .await
+    .with_context(|| format!("request to {addr} timed out"))?
 }
 pub async fn serve(addr: SocketAddr, store: Store, max_connections: usize) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
@@ -62,20 +78,83 @@ pub async fn serve(addr: SocketAddr, store: Store, max_connections: usize) -> Re
         let store = store.clone();
         let permit = limit.clone().acquire_owned().await?;
         tokio::spawn(async move {
-            let response = match recv_frame::<Request>(&mut stream).await {
-                Ok(Request::GetChunk(id)) => store.get_chunk(&id).map(Response::Chunk),
-                Ok(Request::HasChunk(id)) => Ok(Response::Present(store.has_chunk(&id))),
-                Ok(Request::GetManifest(id)) => store.get_manifest(&id).map(Response::Manifest),
-                Ok(Request::PutChunk(id, bytes)) => {
-                    store.put_chunk(&id, &bytes).map(|_| Response::Stored)
-                }
-                Ok(Request::PutManifest(m)) => store.put_manifest(&m).map(|_| Response::Stored),
-                Ok(Request::Ping) => Ok(Response::Pong),
-                Err(e) => Err(e),
+            let response = match timeout(REQUEST_TIMEOUT, recv_frame::<Request>(&mut stream)).await
+            {
+                Err(_) => Err(anyhow::anyhow!("request timed out")),
+                Ok(request) => match request {
+                    Ok(Request::GetChunk(id)) => store.get_chunk(&id).map(Response::Chunk),
+                    Ok(Request::HasChunk(id)) => Ok(Response::Present(store.has_chunk(&id))),
+                    Ok(Request::GetManifest(id)) => store.get_manifest(&id).map(Response::Manifest),
+                    Ok(Request::PutChunk(id, bytes)) => {
+                        store.put_chunk(&id, &bytes).map(|_| Response::Stored)
+                    }
+                    Ok(Request::PutManifest(m)) => store.put_manifest(&m).map(|_| Response::Stored),
+                    Ok(Request::Status) => (|| {
+                        Ok(Response::Status(NodeStatus {
+                            used_bytes: store.used()?,
+                            quota_bytes: store.quota(),
+                            available_bytes: store.available()?,
+                        }))
+                    })(),
+                    Ok(Request::Ping) => Ok(Response::Pong),
+                    Err(e) => Err(e),
+                },
             }
             .unwrap_or_else(|e| Response::Error(e.to_string()));
             let _ = send_frame(&mut stream, &response).await;
             drop(permit);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::hash_bytes;
+    use std::{fs, net::TcpListener as StdTcpListener};
+
+    #[tokio::test]
+    async fn loopback_transfer_and_status() {
+        let root = std::env::temp_dir().join(format!(
+            "bitmesh-network-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let store = Store::open(&root, 1024).unwrap();
+        let probe = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+
+        let server = tokio::spawn(serve(address, store, 4));
+        for _ in 0..20 {
+            if matches!(request(address, Request::Ping).await, Ok(Response::Pong)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let bytes = b"verified network chunk".to_vec();
+        let id = hash_bytes(&bytes);
+        assert!(matches!(
+            request(address, Request::PutChunk(id.clone(), bytes.clone())).await,
+            Ok(Response::Stored)
+        ));
+        assert!(matches!(
+            request(address, Request::GetChunk(id.clone())).await,
+            Ok(Response::Chunk(received)) if received == bytes
+        ));
+        assert!(matches!(
+            request(address, Request::Status).await,
+            Ok(Response::Status(NodeStatus { used_bytes, quota_bytes: 1024, .. }))
+                if used_bytes == bytes.len() as u64
+        ));
+        assert!(matches!(
+            request(address, Request::PutChunk(id, b"corrupt".to_vec())).await,
+            Ok(Response::Error(_))
+        ));
+
+        server.abort();
+        let _ = server.await;
+        let _ = fs::remove_dir_all(root);
     }
 }
