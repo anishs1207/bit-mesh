@@ -1,0 +1,3 @@
+[workspace]
+members = ["programs/bitmesh-payments"]
+resolver = "2"
