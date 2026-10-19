@@ -328,6 +328,7 @@ async fn download(
             found.context("manifest unavailable locally and from peers")?
         }
     };
+    store.put_manifest(&manifest)?;
     let sem = Arc::new(Semaphore::new(parallel.max(1)));
     let results = Arc::new(Mutex::new(HashMap::new()));
     let mut tasks = Vec::new();

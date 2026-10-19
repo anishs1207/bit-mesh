@@ -6,7 +6,10 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -23,6 +26,7 @@ pub struct Lease {
 pub struct Store {
     root: PathBuf,
     quota: u64,
+    write_lock: Arc<Mutex<()>>,
 }
 impl Store {
     pub fn open(root: impl Into<PathBuf>, quota: u64) -> Result<Self> {
@@ -30,7 +34,11 @@ impl Store {
         for dir in ["chunks", "manifests", "leases"] {
             fs::create_dir_all(root.join(dir))?;
         }
-        Ok(Self { root, quota })
+        Ok(Self {
+            root,
+            quota,
+            write_lock: Arc::new(Mutex::new(())),
+        })
     }
     fn checked_id(id: &str) -> Result<&str> {
         validate_content_id(id)?;
@@ -57,6 +65,10 @@ impl Store {
         if hash_bytes(bytes) != expected {
             bail!("chunk hash mismatch");
         }
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("storage write lock poisoned"))?;
         let path = self.chunk_path(expected)?;
         if path.exists() {
             return Ok(false);
@@ -97,6 +109,17 @@ impl Store {
         Ok(manifest)
     }
     pub fn put_lease(&self, lease: &Lease) -> Result<()> {
+        if lease.replication == 0 {
+            bail!("lease replication must be at least one");
+        }
+        if lease.expires_at <= SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() {
+            bail!("lease expiry must be in the future");
+        }
+        if lease.payer.is_some() != lease.payment_signature.is_some() {
+            bail!("payer and payment signature must be supplied together");
+        }
+        self.get_manifest(&lease.manifest)
+            .context("lease references an unavailable manifest")?;
         atomic_write(
             &self
                 .root
@@ -107,14 +130,23 @@ impl Store {
     }
     pub fn active_leases(&self) -> Result<Vec<Lease>> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        Ok(fs::read_dir(self.root.join("leases"))?
-            .filter_map(Result::ok)
-            .filter_map(|e| fs::read(e.path()).ok())
-            .filter_map(|b| serde_json::from_slice::<Lease>(&b).ok())
-            .filter(|l| l.expires_at > now)
-            .collect())
+        let mut leases = Vec::new();
+        for entry in fs::read_dir(self.root.join("leases"))? {
+            let entry = entry?;
+            let bytes = fs::read(entry.path())?;
+            let lease: Lease = serde_json::from_slice(&bytes)
+                .with_context(|| format!("invalid lease metadata in {}", entry.path().display()))?;
+            if lease.expires_at > now {
+                leases.push(lease);
+            }
+        }
+        Ok(leases)
     }
     pub fn garbage_collect(&self) -> Result<(usize, u64)> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("storage write lock poisoned"))?;
         let mut live = HashSet::new();
         for lease in self.active_leases()? {
             if let Ok(m) = self.get_manifest(&lease.manifest) {
@@ -168,6 +200,44 @@ mod tests {
         assert!(s.put_chunk(&id, b"hello").unwrap());
         assert!(!s.put_chunk(&id, b"hello").unwrap());
         assert!(s.put_chunk(&id, b"bad").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_writes_cannot_exceed_quota() {
+        let root = std::env::temp_dir().join(format!(
+            "bitmesh-quota-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let store = Store::open(&root, 5).unwrap();
+        let mut workers = Vec::new();
+        for bytes in [b"aaaa".to_vec(), b"bbbb".to_vec()] {
+            let store = store.clone();
+            workers.push(std::thread::spawn(move || {
+                store.put_chunk(&hash_bytes(&bytes), &bytes)
+            }));
+        }
+        let successes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(Result::is_ok)
+            .count();
+        assert_eq!(successes, 1);
+        assert_eq!(store.used().unwrap(), 4);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn garbage_collection_fails_closed_on_bad_lease() {
+        let root = std::env::temp_dir().join(format!(
+            "bitmesh-gc-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let store = Store::open(&root, 100).unwrap();
+        fs::write(root.join("leases").join("broken"), b"not json").unwrap();
+        assert!(store.garbage_collect().is_err());
         let _ = fs::remove_dir_all(root);
     }
 }
