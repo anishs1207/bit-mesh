@@ -8,7 +8,7 @@ use bit_mesh::{
 };
 use clap::{Parser, Subcommand};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -182,7 +182,11 @@ async fn replicate(
     let mut placements: HashMap<String, Vec<SocketAddr>> = HashMap::new();
     for (chunk, bytes) in m.chunks.iter().zip(chunks) {
         let mut copies = 1;
+        let mut counted = HashSet::new();
         for peer in peers {
+            if !counted.insert(*peer) {
+                continue;
+            }
             if matches!(
                 network::request(*peer, Request::HasChunk(chunk.hash.clone())).await,
                 Ok(Response::Present(true))
@@ -195,6 +199,13 @@ async fn replicate(
                 if copies >= desired {
                     break;
                 }
+                continue;
+            }
+            let has_capacity = matches!(
+                network::request(*peer, Request::Status).await,
+                Ok(Response::Status(status)) if status.available_bytes >= chunk.size
+            );
+            if !has_capacity {
                 continue;
             }
             if matches!(
@@ -319,11 +330,19 @@ async fn repair(
         let bytes = fetch_chunk(store, chunk, peers, peers.len().max(1)).await?;
         let mut sources = probe_sources(&chunk.hash, peers).await;
         let mut copies = 1 + sources.len();
+        let mut attempted: HashSet<_> = sources.iter().map(|source| source.address).collect();
         for peer in peers {
             if copies >= desired {
                 break;
             }
-            if sources.iter().any(|source| source.address == *peer) {
+            if !attempted.insert(*peer) {
+                continue;
+            }
+            let has_capacity = matches!(
+                network::request(*peer, Request::Status).await,
+                Ok(Response::Status(status)) if status.available_bytes >= chunk.size
+            );
+            if !has_capacity {
                 continue;
             }
             if matches!(
