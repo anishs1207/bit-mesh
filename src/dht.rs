@@ -86,7 +86,11 @@ impl Dht {
         let now = Instant::now();
         let records = self.providers.entry(key.to_owned()).or_default();
         records.retain(|(_, expiry)| *expiry > now);
-        records.iter().map(|(p, _)| p.clone()).collect()
+        let target = key_id(key);
+        let mut providers: Vec<_> = records.iter().map(|(p, _)| p.clone()).collect();
+        providers.sort_by_key(|peer| distance(&peer.id, &target));
+        providers.truncate(self.k);
+        providers
     }
 }
 
@@ -118,5 +122,18 @@ mod tests {
     fn content_digest_is_its_own_dht_key() {
         let digest = sha2_bytes(b"chunk");
         assert_eq!(key_id(&hex::encode(digest)), digest);
+    }
+
+    #[test]
+    fn providers_are_bounded_and_ordered_by_distance() {
+        let mut d = Dht::new([0; 32], 1);
+        let key = hex::encode([0u8; 32]);
+        let mut far = Peer::from_address("127.0.0.1:1".parse().unwrap(), 1);
+        far.id = [0xff; 32];
+        let mut close = Peer::from_address("127.0.0.1:2".parse().unwrap(), 1);
+        close.id = [1; 32];
+        d.announce(key.clone(), far, Duration::from_secs(10));
+        d.announce(key.clone(), close.clone(), Duration::from_secs(10));
+        assert_eq!(d.providers(&key), vec![close]);
     }
 }

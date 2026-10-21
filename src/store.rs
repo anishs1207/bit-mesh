@@ -90,6 +90,9 @@ impl Store {
     pub fn has_chunk(&self, id: &str) -> bool {
         self.chunk_path(id).is_ok_and(|p| p.exists())
     }
+    pub fn has_manifest(&self, id: &str) -> bool {
+        Self::checked_id(id).is_ok_and(|id| self.root.join("manifests").join(id).exists())
+    }
     pub fn put_manifest(&self, manifest: &Manifest) -> Result<ContentId> {
         manifest.validate()?;
         let id = manifest.id()?;

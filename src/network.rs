@@ -1,21 +1,23 @@
 use crate::{
-    manifest::{ContentId, Manifest},
+    dht::{Dht, Peer},
+    manifest::{ContentId, Manifest, validate_content_id},
     store::Store,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration as StdDuration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{Mutex, Semaphore},
     time::{Duration, timeout},
 };
 
 const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVIDER_TTL: StdDuration = StdDuration::from_secs(15 * 60);
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     GetChunk(ContentId),
     HasChunk(ContentId),
@@ -23,6 +25,8 @@ pub enum Request {
     PutChunk(ContentId, Vec<u8>),
     PutManifest(Manifest),
     Status,
+    FindProviders(ContentId),
+    AnnounceProvider { content: ContentId, peer: Peer },
     Ping,
 }
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,6 +42,7 @@ pub enum Response {
     Present(bool),
     Stored,
     Status(NodeStatus),
+    Providers(Vec<Peer>),
     Pong,
     Error(String),
 }
@@ -70,12 +75,27 @@ pub async fn request(addr: SocketAddr, request: Request) -> Result<Response> {
     .await
     .with_context(|| format!("request to {addr} timed out"))?
 }
+pub async fn request_peer(peer: &Peer, request: Request) -> Result<Response> {
+    match self::request(peer.address, request.clone()).await {
+        Ok(response) => Ok(response),
+        Err(direct_error) => match peer.relay {
+            Some(relay) => self::request(relay, request).await.with_context(|| {
+                format!("direct connection failed: {direct_error}; relay {relay} failed")
+            }),
+            None => Err(direct_error),
+        },
+    }
+}
 pub async fn serve(addr: SocketAddr, store: Store, max_connections: usize) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
+    let local = Peer::from_address(addr, store.quota());
+    let dht = Arc::new(Mutex::new(Dht::new(local.id, 20)));
     let limit = Arc::new(Semaphore::new(max_connections.max(1)));
     loop {
         let (mut stream, _) = listener.accept().await?;
         let store = store.clone();
+        let dht = dht.clone();
+        let local = local.clone();
         let permit = limit.clone().acquire_owned().await?;
         tokio::spawn(async move {
             let response = match timeout(REQUEST_TIMEOUT, recv_frame::<Request>(&mut stream)).await
@@ -96,6 +116,29 @@ pub async fn serve(addr: SocketAddr, store: Store, max_connections: usize) -> Re
                             available_bytes: store.available()?,
                         }))
                     })(),
+                    Ok(Request::FindProviders(id)) => {
+                        if let Err(error) = validate_content_id(&id) {
+                            Err(error)
+                        } else {
+                            let mut providers = dht.lock().await.providers(&id);
+                            if store.has_chunk(&id) || store.has_manifest(&id) {
+                                providers.retain(|peer| peer.id != local.id);
+                                providers.insert(0, local.clone());
+                            }
+                            Ok(Response::Providers(providers))
+                        }
+                    }
+                    Ok(Request::AnnounceProvider { content, peer }) => {
+                        match validate_content_id(&content) {
+                            Err(error) => Err(error),
+                            Ok(()) => {
+                                let mut dht = dht.lock().await;
+                                dht.add_peer(peer.clone());
+                                dht.announce(content, peer, PROVIDER_TTL);
+                                Ok(Response::Stored)
+                            }
+                        }
+                    }
                     Ok(Request::Ping) => Ok(Response::Pong),
                     Err(e) => Err(e),
                 },
@@ -138,6 +181,10 @@ mod tests {
         assert!(matches!(
             request(address, Request::PutChunk(id.clone(), bytes.clone())).await,
             Ok(Response::Stored)
+        ));
+        assert!(matches!(
+            request(address, Request::FindProviders(hash_bytes(&bytes))).await,
+            Ok(Response::Providers(providers)) if providers.first().is_some_and(|p| p.address == address)
         ));
         assert!(matches!(
             request(address, Request::GetChunk(id.clone())).await,

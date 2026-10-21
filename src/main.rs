@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use bit_mesh::{
     DEFAULT_CHUNK_SIZE,
+    dht::Peer,
     manifest::{ChunkRef, Manifest},
     network::{self, Request, Response},
     store::{Lease, Store},
@@ -178,6 +179,7 @@ async fn replicate(
             peers.len()
         );
     }
+    let mut placements: HashMap<String, Vec<SocketAddr>> = HashMap::new();
     for (chunk, bytes) in m.chunks.iter().zip(chunks) {
         let mut copies = 1;
         for peer in peers {
@@ -186,6 +188,10 @@ async fn replicate(
                 Ok(Response::Present(true))
             ) {
                 copies += 1;
+                placements
+                    .entry(chunk.hash.clone())
+                    .or_default()
+                    .push(*peer);
                 if copies >= desired {
                     break;
                 }
@@ -196,6 +202,10 @@ async fn replicate(
                 Ok(Response::Stored)
             ) {
                 copies += 1;
+                placements
+                    .entry(chunk.hash.clone())
+                    .or_default()
+                    .push(*peer);
             }
             if copies >= desired {
                 break;
@@ -211,16 +221,50 @@ async fn replicate(
     for peer in peers {
         let _ = network::request(*peer, Request::PutManifest(m.clone())).await;
     }
+    for (content, providers) in placements {
+        for seed in peers {
+            for address in &providers {
+                let _ = network::request(
+                    *seed,
+                    Request::AnnounceProvider {
+                        content: content.clone(),
+                        peer: Peer::from_address(*address, 0),
+                    },
+                )
+                .await;
+            }
+        }
+    }
     Ok(())
 }
 
-async fn probe_sources(hash: &str, peers: &[SocketAddr]) -> Vec<SocketAddr> {
+async fn probe_sources(hash: &str, peers: &[SocketAddr]) -> Vec<Peer> {
+    let mut candidates: HashMap<_, _> = peers
+        .iter()
+        .copied()
+        .map(|address| {
+            let peer = Peer::from_address(address, 0);
+            (peer.id, peer)
+        })
+        .collect();
+    let mut lookups = tokio::task::JoinSet::new();
+    for seed in peers.iter().copied() {
+        let hash = hash.to_owned();
+        lookups.spawn(async move { network::request(seed, Request::FindProviders(hash)).await });
+    }
+    while let Some(result) = lookups.join_next().await {
+        if let Ok(Ok(Response::Providers(providers))) = result {
+            for provider in providers {
+                candidates.insert(provider.id, provider);
+            }
+        }
+    }
     let mut tasks = tokio::task::JoinSet::new();
-    for peer in peers.iter().copied() {
+    for peer in candidates.into_values() {
         let hash = hash.to_owned();
         tasks.spawn(async move {
             matches!(
-                network::request(peer, Request::HasChunk(hash)).await,
+                network::request_peer(&peer, Request::HasChunk(hash)).await,
                 Ok(Response::Present(true))
             )
             .then_some(peer)
@@ -249,7 +293,7 @@ async fn fetch_chunk(
     let sources = probe_sources(&chunk.hash, peers).await;
     for peer in sources.iter().cycle().take(retries.max(1)) {
         if let Ok(Response::Chunk(bytes)) =
-            network::request(*peer, Request::GetChunk(chunk.hash.clone())).await
+            network::request_peer(peer, Request::GetChunk(chunk.hash.clone())).await
         {
             if bytes.len() as u64 == chunk.size
                 && bit_mesh::manifest::hash_bytes(&bytes) == chunk.hash
@@ -279,7 +323,7 @@ async fn repair(
             if copies >= desired {
                 break;
             }
-            if sources.contains(peer) {
+            if sources.iter().any(|source| source.address == *peer) {
                 continue;
             }
             if matches!(
@@ -287,7 +331,7 @@ async fn repair(
                 Ok(Response::Stored)
             ) {
                 copies += 1;
-                sources.push(*peer);
+                sources.push(Peer::from_address(*peer, 0));
             }
         }
         if copies < desired {
@@ -354,7 +398,7 @@ async fn download(
                 let mut value = None;
                 for peer in sources.iter().cycle().take(retries.max(1)) {
                     if let Ok(Response::Chunk(bytes)) =
-                        network::request(*peer, Request::GetChunk(chunk.hash.clone())).await
+                        network::request_peer(peer, Request::GetChunk(chunk.hash.clone())).await
                     {
                         if bytes.len() as u64 == chunk.size
                             && bit_mesh::manifest::hash_bytes(&bytes) == chunk.hash
