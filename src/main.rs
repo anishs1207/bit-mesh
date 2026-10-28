@@ -403,6 +403,54 @@ mod tests {
         replacement_task.abort();
         let _ = fs::remove_dir_all(root);
     }
+
+    #[tokio::test]
+    async fn upload_then_download_through_seed() {
+        let root =
+            std::env::temp_dir().join(format!("bitmesh-transfer-test-{}", std::process::id()));
+        let source = root.join("source.bin");
+        let output = root.join("output.bin");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source, b"abcabcxyz").unwrap();
+        let uploader = Store::open(root.join("uploader"), 100).unwrap();
+        let replica = Store::open(root.join("replica"), 100).unwrap();
+        let downloader = Store::open(root.join("downloader"), 100).unwrap();
+        let address = free_address();
+        let server = tokio::spawn(network::serve(address, replica.clone(), 4));
+        for _ in 0..30 {
+            if matches!(
+                network::request(address, Request::Ping).await,
+                Ok(Response::Pong)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let manifest = Manifest::from_file_with(&source, 3, |chunk, bytes| {
+            uploader.put_chunk(&chunk.hash, bytes)?;
+            Ok(())
+        })
+        .unwrap();
+        let id = uploader.put_manifest(&manifest).unwrap();
+        let lease = Lease {
+            manifest: id.clone(),
+            expires_at: u64::MAX,
+            replication: 2,
+            payer: None,
+            payment_signature: None,
+        };
+        replicate(&uploader, &manifest, &lease, &[address])
+            .await
+            .unwrap();
+        uploader.put_lease(&lease).unwrap();
+        assert_eq!(replica.garbage_collect().unwrap().0, 0);
+        download(&downloader, &id, &output, &[address], 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&output).unwrap());
+        server.abort();
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 async fn probe_sources(hash: &str, peers: &[SocketAddr]) -> Vec<Peer> {
