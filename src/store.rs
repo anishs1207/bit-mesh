@@ -79,7 +79,12 @@ impl Store {
         } else {
             0
         };
-        if self.used()?.saturating_sub(old_size).saturating_add(bytes.len() as u64) > self.quota {
+        if self
+            .used()?
+            .saturating_sub(old_size)
+            .saturating_add(bytes.len() as u64)
+            > self.quota
+        {
             bail!("storage quota exceeded");
         }
         if existed {
@@ -100,7 +105,7 @@ impl Store {
         self.get_chunk(id).is_ok()
     }
     pub fn has_manifest(&self, id: &str) -> bool {
-        Self::checked_id(id).is_ok_and(|id| self.root.join("manifests").join(id).exists())
+        self.get_manifest(id).is_ok()
     }
     pub fn put_manifest(&self, manifest: &Manifest) -> Result<ContentId> {
         manifest.validate()?;
@@ -121,7 +126,10 @@ impl Store {
         Ok(manifest)
     }
     pub fn put_lease(&self, lease: &Lease) -> Result<()> {
-        let _guard = self.write_lock.lock().map_err(|_| anyhow::anyhow!("storage write lock poisoned"))?;
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("storage write lock poisoned"))?;
         if lease.replication == 0 {
             bail!("lease replication must be at least one");
         }
@@ -133,7 +141,10 @@ impl Store {
         }
         self.get_manifest(&lease.manifest)
             .context("lease references an unavailable manifest")?;
-        let path = self.root.join("leases").join(Self::checked_id(&lease.manifest)?);
+        let path = self
+            .root
+            .join("leases")
+            .join(Self::checked_id(&lease.manifest)?);
         let bytes = serde_json::to_vec_pretty(lease)?;
         // A renewed lease must replace its old expiry. Hold the same lock as GC.
         atomic_replace(&path, &bytes)
@@ -159,9 +170,10 @@ impl Store {
             .map_err(|_| anyhow::anyhow!("storage write lock poisoned"))?;
         let mut live = HashSet::new();
         for lease in self.active_leases()? {
-            if let Ok(m) = self.get_manifest(&lease.manifest) {
-                live.extend(m.chunks.into_iter().map(|c| c.hash));
-            }
+            let m = self.get_manifest(&lease.manifest).with_context(|| {
+                format!("active lease {} has no valid manifest", lease.manifest)
+            })?;
+            live.extend(m.chunks.into_iter().map(|c| c.hash));
         }
         let mut count = 0;
         let mut bytes = 0;
@@ -203,7 +215,10 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
     static NEXT_REPLACE: AtomicU64 = AtomicU64::new(0);
     let suffix = NEXT_REPLACE.fetch_add(1, Ordering::Relaxed);
     let temp = path.with_extension(format!("replace-{}-{suffix}", std::process::id()));
-    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     // Windows does not replace an existing destination with rename.
@@ -271,7 +286,8 @@ mod tests {
 
     #[test]
     fn corrupt_chunk_is_not_reported_and_can_be_repaired() {
-        let root = std::env::temp_dir().join(format!("bitmesh-corrupt-test-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("bitmesh-corrupt-test-{}", std::process::id()));
         let store = Store::open(&root, 5).unwrap();
         let id = hash_bytes(b"hello");
         store.put_chunk(&id, b"hello").unwrap();

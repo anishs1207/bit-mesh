@@ -16,6 +16,9 @@ cargo run -- --data node-c --quota 10737418240 serve --listen 127.0.0.1:7402
 cargo run -- --data node-d --quota 10737418240 serve --listen 127.0.0.1:7403
 ```
 
+Use `--peers` on `serve` to join nodes to a shared routing graph, for example
+`node-b ... serve --listen 127.0.0.1:7401 --peers 127.0.0.1:7402`.
+
 Upload a file with three total copies (the uploader plus two storage nodes):
 
 ```powershell
@@ -40,10 +43,17 @@ Repair obtains a surviving valid copy, checks reported capacity, restores the
 requested number of distinct replicas, and republishes the manifest. It fails
 explicitly if too few valid sources or destinations remain.
 
+To check and repair active leases periodically, serve the uploader's data directory:
+
+```powershell
+cargo run -- --data node-a serve --listen 127.0.0.1:7400 --peers 127.0.0.1:7401,127.0.0.1:7402,127.0.0.1:7403 --repair-interval-seconds 60
+```
+
 ## Leases and Solana payments
 
-Uploads create a local storage lease (seven days by default). Active leases pin
-their manifest's chunks; `gc` removes unleased chunks. Inspect local and remote
+Uploads create storage leases on the uploader and confirmed replica nodes (seven
+days by default). Active leases pin their manifest's chunks; `gc` removes
+unleased chunks. Inspect local and remote
 capacity with `status`, and change the lifetime with `--lease-seconds`.
 
 `anchor/programs/bitmesh-payments` contains the Anchor escrow program. Its
@@ -63,7 +73,7 @@ cluster before accepting storage.
 ## Design and boundaries
 
 - Provider records expire after 15 minutes and are ordered by Kademlia XOR
-  distance. Downloads query seeds, deduplicate discovered node IDs, probe them in
+  distance. Downloads follow routing contacts from seeds, deduplicate discovered node IDs, probe them in
   parallel, prioritize rare chunks, and naturally try quick responders first.
 - A peer record can carry a relay endpoint. Requests try the direct address first
   and then that endpoint, allowing a relay service to expose a NAT-bound node.

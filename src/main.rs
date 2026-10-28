@@ -33,6 +33,8 @@ enum Command {
         listen: SocketAddr,
         #[arg(long, value_delimiter = ',')]
         peers: Vec<SocketAddr>,
+        #[arg(long)]
+        repair_interval_seconds: Option<u64>,
     },
     Upload {
         file: PathBuf,
@@ -81,7 +83,53 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let store = Store::open(&cli.data, cli.quota)?;
     match cli.command {
-        Command::Serve { listen, peers } => {
+        Command::Serve {
+            listen,
+            peers,
+            repair_interval_seconds,
+        } => {
+            if let Some(seconds) = repair_interval_seconds {
+                if seconds == 0 || peers.is_empty() {
+                    bail!("automatic repair needs a positive interval and at least one peer");
+                }
+                let repair_store = store.clone();
+                let repair_peers = peers.clone();
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(seconds));
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        match repair_store.active_leases() {
+                            Ok(leases) => {
+                                for lease in leases {
+                                    match repair_store.get_manifest(&lease.manifest) {
+                                        Ok(manifest) => {
+                                            if let Err(error) = repair(
+                                                &repair_store,
+                                                &manifest,
+                                                lease.replication,
+                                                &repair_peers,
+                                            )
+                                            .await
+                                            {
+                                                eprintln!(
+                                                    "repair {} failed: {error:#}",
+                                                    lease.manifest
+                                                );
+                                            }
+                                        }
+                                        Err(error) => {
+                                            eprintln!("repair {} failed: {error:#}", lease.manifest)
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => eprintln!("repair scan failed: {error:#}"),
+                        }
+                    }
+                });
+            }
             println!("bitmesh node listening on {listen}");
             network::serve_with_peers(listen, store, 128, &peers).await
         }
@@ -296,6 +344,63 @@ mod tests {
         assert!(sources.iter().any(|peer| peer.address == holder));
         middle_task.abort();
         holder_task.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn repair_restores_replica_and_pins_it() {
+        let root = std::env::temp_dir().join(format!("bitmesh-repair-test-{}", std::process::id()));
+        let first = free_address();
+        let replacement = free_address();
+        let local = Store::open(root.join("local"), 100).unwrap();
+        let existing = Store::open(root.join("existing"), 100).unwrap();
+        let new_store = Store::open(root.join("replacement"), 100).unwrap();
+        let bytes = b"a valid surviving copy";
+        let hash = bit_mesh::manifest::hash_bytes(bytes);
+        local.put_chunk(&hash, bytes).unwrap();
+        existing.put_chunk(&hash, bytes).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            name: "file".into(),
+            size: bytes.len() as u64,
+            chunk_size: bytes.len(),
+            chunks: vec![ChunkRef {
+                hash: hash.clone(),
+                size: bytes.len() as u64,
+            }],
+            created_at: 0,
+        };
+        let id = local.put_manifest(&manifest).unwrap();
+        local
+            .put_lease(&Lease {
+                manifest: id,
+                expires_at: u64::MAX,
+                replication: 3,
+                payer: None,
+                payment_signature: None,
+            })
+            .unwrap();
+        let first_task = tokio::spawn(network::serve(first, existing, 4));
+        let replacement_task = tokio::spawn(network::serve(replacement, new_store.clone(), 4));
+        for _ in 0..30 {
+            if matches!(
+                network::request(first, Request::Ping).await,
+                Ok(Response::Pong)
+            ) && matches!(
+                network::request(replacement, Request::Ping).await,
+                Ok(Response::Pong)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        repair(&local, &manifest, 3, &[first, replacement])
+            .await
+            .unwrap();
+        assert!(new_store.has_chunk(&hash));
+        assert_eq!(new_store.garbage_collect().unwrap().0, 0);
+        first_task.abort();
+        replacement_task.abort();
         let _ = fs::remove_dir_all(root);
     }
 }
