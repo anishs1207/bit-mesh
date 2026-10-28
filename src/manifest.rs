@@ -43,11 +43,23 @@ pub fn hash_bytes(bytes: &[u8]) -> ContentId {
 
 impl Manifest {
     pub fn from_file(path: &Path, chunk_size: usize) -> Result<(Self, Vec<Vec<u8>>)> {
+        let mut chunks = Vec::new();
+        let manifest = Self::from_file_with(path, chunk_size, |_, bytes| {
+            chunks.push(bytes.to_vec());
+            Ok(())
+        })?;
+        Ok((manifest, chunks))
+    }
+
+    pub fn from_file_with(
+        path: &Path,
+        chunk_size: usize,
+        mut on_chunk: impl FnMut(&ChunkRef, &[u8]) -> Result<()>,
+    ) -> Result<Self> {
         if chunk_size == 0 {
             bail!("chunk size must be greater than zero");
         }
         let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let mut chunks = Vec::new();
         let mut refs = Vec::new();
         let mut total = 0u64;
         loop {
@@ -65,27 +77,25 @@ impl Manifest {
             }
             buf.truncate(read);
             total += read as u64;
-            refs.push(ChunkRef {
+            let reference = ChunkRef {
                 hash: hash_bytes(&buf),
                 size: read as u64,
-            });
-            chunks.push(buf);
+            };
+            on_chunk(&reference, &buf)?;
+            refs.push(reference);
         }
-        Ok((
-            Self {
-                version: 1,
-                name: path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("file")
-                    .to_owned(),
-                size: total,
-                chunk_size,
-                chunks: refs,
-                created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-            },
-            chunks,
-        ))
+        Ok(Self {
+            version: 1,
+            name: path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file")
+                .to_owned(),
+            size: total,
+            chunk_size,
+            chunks: refs,
+            created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        })
     }
 
     pub fn id(&self) -> Result<ContentId> {
@@ -168,5 +178,21 @@ mod tests {
         m.size = 3;
         m.chunks[0].hash.make_ascii_uppercase();
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn streams_chunks_without_retaining_file_bytes() {
+        let path = std::env::temp_dir().join(format!("bitmesh-stream-test-{}", std::process::id()));
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let mut seen = Vec::new();
+        let manifest = Manifest::from_file_with(&path, 3, |reference, bytes| {
+            assert_eq!(reference.hash, hash_bytes(bytes));
+            seen.push(bytes.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![b"abc".to_vec(), b"def".to_vec(), b"gh".to_vec()]);
+        assert_eq!(manifest.size, 8);
+        let _ = std::fs::remove_file(path);
     }
 }

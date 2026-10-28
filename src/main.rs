@@ -14,11 +14,7 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::{
-    fs::File,
-    io::AsyncWriteExt,
-    sync::{Mutex, Semaphore},
-};
+use tokio::{fs::File, io::AsyncWriteExt, sync::Semaphore};
 
 #[derive(Parser)]
 #[command(version, about = "Content-addressed peer-to-peer storage")]
@@ -98,10 +94,10 @@ async fn main() -> Result<()> {
             payer,
             payment_signature,
         } => {
-            let (manifest, chunks) = Manifest::from_file(&file, chunk_size)?;
-            for (reference, bytes) in manifest.chunks.iter().zip(&chunks) {
+            let manifest = Manifest::from_file_with(&file, chunk_size, |reference, bytes| {
                 store.put_chunk(&reference.hash, bytes)?;
-            }
+                Ok(())
+            })?;
             let id = store.put_manifest(&manifest)?;
             let expiry = SystemTime::now()
                 .duration_since(UNIX_EPOCH)?
@@ -114,7 +110,7 @@ async fn main() -> Result<()> {
                 payer,
                 payment_signature,
             };
-            replicate(&manifest, &chunks, &lease, &peers).await?;
+            replicate(&store, &manifest, &lease, &peers).await?;
             store.put_lease(&lease)?;
             println!("{id}");
             Ok(())
@@ -163,12 +159,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn replicate(
-    m: &Manifest,
-    chunks: &[Vec<u8>],
-    lease: &Lease,
-    peers: &[SocketAddr],
-) -> Result<()> {
+async fn replicate(store: &Store, m: &Manifest, lease: &Lease, peers: &[SocketAddr]) -> Result<()> {
     let desired = lease.replication;
     if desired == 0 {
         bail!("replication must be at least one");
@@ -184,7 +175,8 @@ async fn replicate(
         );
     }
     let mut placements: HashMap<String, Vec<SocketAddr>> = HashMap::new();
-    for (chunk, bytes) in m.chunks.iter().zip(chunks) {
+    for chunk in &m.chunks {
+        let bytes = store.get_chunk(&chunk.hash)?;
         let mut copies = 1;
         let mut counted = HashSet::new();
         for peer in peers {
@@ -285,9 +277,8 @@ mod tests {
         let bytes = b"through a routing peer";
         let id = bit_mesh::manifest::hash_bytes(bytes);
         b.put_chunk(&id, bytes).unwrap();
-        let middle_task = tokio::spawn(async move {
-            network::serve_with_peers(middle, a, 4, &[holder]).await
-        });
+        let middle_task =
+            tokio::spawn(async move { network::serve_with_peers(middle, a, 4, &[holder]).await });
         let holder_task = tokio::spawn(network::serve(holder, b, 4));
         for _ in 0..30 {
             if matches!(
@@ -523,22 +514,20 @@ async fn download(
     };
     store.put_manifest(&manifest)?;
     let sem = Arc::new(Semaphore::new(parallel.max(1)));
-    let results = Arc::new(Mutex::new(HashMap::new()));
     let mut tasks = Vec::new();
     let mut jobs = Vec::with_capacity(manifest.chunks.len());
-    for (index, chunk) in manifest.chunks.iter().cloned().enumerate() {
+    for chunk in manifest.chunks.iter().cloned() {
         let sources = if store.has_chunk(&chunk.hash) {
             Vec::new()
         } else {
             probe_sources(&chunk.hash, peers).await
         };
-        jobs.push((index, chunk, sources));
+        jobs.push((chunk, sources));
     }
-    jobs.sort_by_key(|(_, _, sources)| sources.len());
-    for (index, chunk, sources) in jobs {
+    jobs.sort_by_key(|(_, sources)| sources.len());
+    for (chunk, sources) in jobs {
         let permit = sem.clone().acquire_owned().await?;
         let store = store.clone();
-        let results = results.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
             let bytes = if let Ok(bytes) = store.get_chunk(&chunk.hash) {
@@ -561,7 +550,6 @@ async fn download(
             }
             .with_context(|| format!("chunk {} unavailable", chunk.hash))?;
             store.put_chunk(&chunk.hash, &bytes)?;
-            results.lock().await.insert(index, bytes);
             Ok::<_, anyhow::Error>(())
         }));
     }
@@ -569,15 +557,9 @@ async fn download(
         task.await??;
     }
     let mut file = File::create(output).await?;
-    let mut chunks = results.lock().await;
-    for i in 0..manifest.chunks.len() {
-        file.write_all(
-            chunks
-                .remove(&i)
-                .context("scheduler lost chunk")?
-                .as_slice(),
-        )
-        .await?;
+    for chunk in &manifest.chunks {
+        let bytes = store.get_chunk(&chunk.hash)?;
+        file.write_all(&bytes).await?;
     }
     file.flush().await?;
     println!("wrote {} bytes to {}", manifest.size, output.display());
