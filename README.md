@@ -75,14 +75,17 @@ cluster before accepting storage.
 - Provider records expire after 15 minutes and are ordered by Kademlia XOR
   distance. Downloads follow routing contacts from seeds, deduplicate discovered node IDs, probe them in
   parallel, prioritize rare chunks, and naturally try quick responders first.
-- A peer record can carry a relay endpoint. Requests try the direct address first
-  and then that endpoint, allowing a relay service to expose a NAT-bound node.
+- A peer record can carry a fallback endpoint. Requests try the direct address
+  first and then that endpoint. The current protocol does not implement a relay
+  tunnel for nodes behind NAT.
 - Writes are atomic and serialized for quota accounting. Content IDs are strictly
   validated, and corrupt local or remote bytes are rejected.
+- The routing table is a compact XOR-distance table with iterative lookups, not
+  a full Kademlia implementation with bucket refresh and persistent contacts.
 - The JSON-over-TCP protocol is intentionally small. Internet deployment still
   requires authenticated/encrypted transport, signed provider announcements,
   durable routing tables, a real relay/TURN service, and on-chain transaction
-  verification.
+  verification. Payment metadata recorded by the CLI is not proof of payment.
 
 Run the core tests with `cargo test --all --all-targets`. Run the Anchor program
 tests with `cargo test --manifest-path anchor/programs/bitmesh-payments/Cargo.toml`.
