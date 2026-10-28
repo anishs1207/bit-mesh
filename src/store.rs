@@ -110,10 +110,17 @@ impl Store {
     pub fn put_manifest(&self, manifest: &Manifest) -> Result<ContentId> {
         manifest.validate()?;
         let id = manifest.id()?;
-        atomic_write(
-            &self.root.join("manifests").join(&id),
-            &serde_json::to_vec_pretty(manifest)?,
-        )?;
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("storage write lock poisoned"))?;
+        let path = self.root.join("manifests").join(&id);
+        let bytes = serde_json::to_vec_pretty(manifest)?;
+        if path.exists() && self.get_manifest(&id).is_err() {
+            atomic_replace(&path, &bytes)?;
+        } else {
+            atomic_write(&path, &bytes)?;
+        }
         Ok(id)
     }
     pub fn get_manifest(&self, id: &str) -> Result<Manifest> {
@@ -295,6 +302,27 @@ mod tests {
         assert!(!store.has_chunk(&id));
         assert!(store.put_chunk(&id, b"hello").unwrap());
         assert_eq!(store.get_chunk(&id).unwrap(), b"hello");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corrupt_manifest_can_be_replaced() {
+        let root =
+            std::env::temp_dir().join(format!("bitmesh-manifest-test-{}", std::process::id()));
+        let store = Store::open(&root, 100).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            name: "empty".into(),
+            size: 0,
+            chunk_size: 1,
+            chunks: vec![],
+            created_at: 0,
+        };
+        let id = store.put_manifest(&manifest).unwrap();
+        fs::write(root.join("manifests").join(&id), b"bad json").unwrap();
+        assert!(!store.has_manifest(&id));
+        store.put_manifest(&manifest).unwrap();
+        assert_eq!(store.get_manifest(&id).unwrap(), manifest);
         let _ = fs::remove_dir_all(root);
     }
 }
