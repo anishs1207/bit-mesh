@@ -105,14 +105,15 @@ async fn main() -> Result<()> {
                 .duration_since(UNIX_EPOCH)?
                 .as_secs()
                 .saturating_add(lease_seconds);
-            store.put_lease(&Lease {
+            let lease = Lease {
                 manifest: id.clone(),
                 expires_at: expiry,
                 replication,
                 payer,
                 payment_signature,
-            })?;
-            replicate(&manifest, &chunks, replication, &peers).await?;
+            };
+            replicate(&manifest, &chunks, &lease, &peers).await?;
+            store.put_lease(&lease)?;
             println!("{id}");
             Ok(())
         }
@@ -163,9 +164,10 @@ async fn main() -> Result<()> {
 async fn replicate(
     m: &Manifest,
     chunks: &[Vec<u8>],
-    desired: usize,
+    lease: &Lease,
     peers: &[SocketAddr],
 ) -> Result<()> {
+    let desired = lease.replication;
     if desired == 0 {
         bail!("replication must be at least one");
     }
@@ -230,7 +232,18 @@ async fn replicate(
         }
     }
     for peer in peers {
-        let _ = network::request(*peer, Request::PutManifest(m.clone())).await;
+        let response = network::request(*peer, Request::PutManifest(m.clone())).await;
+        if placements.values().any(|holders| holders.contains(peer)) {
+            if !matches!(response, Ok(Response::Stored)) {
+                bail!("failed to publish manifest to replica {peer}");
+            }
+            if !matches!(
+                network::request(*peer, Request::PutLease(lease.clone())).await,
+                Ok(Response::Stored)
+            ) {
+                bail!("failed to pin lease on replica {peer}");
+            }
+        }
     }
     for (content, providers) in placements {
         for seed in peers {
@@ -326,6 +339,13 @@ async fn repair(
     if desired == 0 {
         bail!("replication must be at least one");
     }
+    let id = manifest.id()?;
+    let mut lease = store
+        .active_leases()?
+        .into_iter()
+        .find(|lease| lease.manifest == id)
+        .context("repair requires an active local lease")?;
+    lease.replication = desired;
     for chunk in &manifest.chunks {
         let bytes = fetch_chunk(store, chunk, peers, peers.len().max(1)).await?;
         let mut sources = probe_sources(&chunk.hash, peers).await;
@@ -361,8 +381,19 @@ async fn repair(
         }
     }
     for peer in peers {
-        let _ = network::request(*peer, Request::PutManifest(manifest.clone())).await;
+        if matches!(
+            network::request(*peer, Request::PutManifest(manifest.clone())).await,
+            Ok(Response::Stored)
+        ) {
+            if !matches!(
+                network::request(*peer, Request::PutLease(lease.clone())).await,
+                Ok(Response::Stored)
+            ) {
+                bail!("failed to renew lease on replica {peer}");
+            }
+        }
     }
+    store.put_lease(&lease)?;
     Ok(())
 }
 

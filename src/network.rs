@@ -1,7 +1,7 @@
 use crate::{
     dht::{Dht, Peer},
     manifest::{ContentId, Manifest, validate_content_id},
-    store::Store,
+    store::{Lease, Store},
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,7 @@ pub enum Request {
     GetManifest(ContentId),
     PutChunk(ContentId, Vec<u8>),
     PutManifest(Manifest),
+    PutLease(Lease),
     Status,
     FindProviders(ContentId),
     AnnounceProvider { content: ContentId, peer: Peer },
@@ -109,6 +110,9 @@ pub async fn serve(addr: SocketAddr, store: Store, max_connections: usize) -> Re
                         store.put_chunk(&id, &bytes).map(|_| Response::Stored)
                     }
                     Ok(Request::PutManifest(m)) => store.put_manifest(&m).map(|_| Response::Stored),
+                    Ok(Request::PutLease(lease)) => {
+                        store.put_lease(&lease).map(|_| Response::Stored)
+                    }
                     Ok(Request::Status) => (|| {
                         Ok(Response::Status(NodeStatus {
                             used_bytes: store.used()?,
@@ -153,7 +157,7 @@ pub async fn serve(addr: SocketAddr, store: Store, max_connections: usize) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::hash_bytes;
+    use crate::manifest::{ChunkRef, hash_bytes};
     use std::{fs, net::TcpListener as StdTcpListener};
 
     #[tokio::test]
@@ -168,7 +172,7 @@ mod tests {
         let address = probe.local_addr().unwrap();
         drop(probe);
 
-        let server = tokio::spawn(serve(address, store, 4));
+        let server = tokio::spawn(serve(address, store.clone(), 4));
         for _ in 0..20 {
             if matches!(request(address, Request::Ping).await, Ok(Response::Pong)) {
                 break;
@@ -199,6 +203,35 @@ mod tests {
             request(address, Request::PutChunk(id, b"corrupt".to_vec())).await,
             Ok(Response::Error(_))
         ));
+
+        let manifest = Manifest {
+            version: 1,
+            name: "sample".into(),
+            size: bytes.len() as u64,
+            chunk_size: bytes.len(),
+            chunks: vec![ChunkRef {
+                hash: hash_bytes(&bytes),
+                size: bytes.len() as u64,
+            }],
+            created_at: 0,
+        };
+        let lease = Lease {
+            manifest: manifest.id().unwrap(),
+            expires_at: u64::MAX,
+            replication: 2,
+            payer: None,
+            payment_signature: None,
+        };
+        assert!(matches!(
+            request(address, Request::PutManifest(manifest)).await,
+            Ok(Response::Stored)
+        ));
+        assert!(matches!(
+            request(address, Request::PutLease(lease)).await,
+            Ok(Response::Stored)
+        ));
+        assert_eq!(store.garbage_collect().unwrap().0, 0);
+        assert!(store.has_chunk(&hash_bytes(&bytes)));
 
         server.abort();
         let _ = server.await;
