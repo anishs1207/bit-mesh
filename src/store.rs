@@ -70,11 +70,20 @@ impl Store {
             .lock()
             .map_err(|_| anyhow::anyhow!("storage write lock poisoned"))?;
         let path = self.chunk_path(expected)?;
-        if path.exists() {
-            return Ok(false);
-        }
-        if self.used()?.saturating_add(bytes.len() as u64) > self.quota {
+        let existed = path.exists();
+        let old_size = if existed {
+            if self.get_chunk(expected).is_ok() {
+                return Ok(false);
+            }
+            fs::metadata(&path)?.len()
+        } else {
+            0
+        };
+        if self.used()?.saturating_sub(old_size).saturating_add(bytes.len() as u64) > self.quota {
             bail!("storage quota exceeded");
+        }
+        if existed {
+            fs::remove_file(&path)?;
         }
         atomic_write(&path, bytes)?;
         Ok(true)
@@ -88,7 +97,7 @@ impl Store {
         Ok(bytes)
     }
     pub fn has_chunk(&self, id: &str) -> bool {
-        self.chunk_path(id).is_ok_and(|p| p.exists())
+        self.get_chunk(id).is_ok()
     }
     pub fn has_manifest(&self, id: &str) -> bool {
         Self::checked_id(id).is_ok_and(|id| self.root.join("manifests").join(id).exists())
@@ -112,6 +121,7 @@ impl Store {
         Ok(manifest)
     }
     pub fn put_lease(&self, lease: &Lease) -> Result<()> {
+        let _guard = self.write_lock.lock().map_err(|_| anyhow::anyhow!("storage write lock poisoned"))?;
         if lease.replication == 0 {
             bail!("lease replication must be at least one");
         }
@@ -123,13 +133,10 @@ impl Store {
         }
         self.get_manifest(&lease.manifest)
             .context("lease references an unavailable manifest")?;
-        atomic_write(
-            &self
-                .root
-                .join("leases")
-                .join(Self::checked_id(&lease.manifest)?),
-            &serde_json::to_vec_pretty(lease)?,
-        )
+        let path = self.root.join("leases").join(Self::checked_id(&lease.manifest)?);
+        let bytes = serde_json::to_vec_pretty(lease)?;
+        // A renewed lease must replace its old expiry. Hold the same lock as GC.
+        atomic_replace(&path, &bytes)
     }
     pub fn active_leases(&self) -> Result<Vec<Lease>> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -192,6 +199,24 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    static NEXT_REPLACE: AtomicU64 = AtomicU64::new(0);
+    let suffix = NEXT_REPLACE.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("replace-{}-{suffix}", std::process::id()));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    // Windows does not replace an existing destination with rename.
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +266,19 @@ mod tests {
         let store = Store::open(&root, 100).unwrap();
         fs::write(root.join("leases").join("broken"), b"not json").unwrap();
         assert!(store.garbage_collect().is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corrupt_chunk_is_not_reported_and_can_be_repaired() {
+        let root = std::env::temp_dir().join(format!("bitmesh-corrupt-test-{}", std::process::id()));
+        let store = Store::open(&root, 5).unwrap();
+        let id = hash_bytes(b"hello");
+        store.put_chunk(&id, b"hello").unwrap();
+        fs::write(store.chunk_path(&id).unwrap(), b"bad!!").unwrap();
+        assert!(!store.has_chunk(&id));
+        assert!(store.put_chunk(&id, b"hello").unwrap());
+        assert_eq!(store.get_chunk(&id).unwrap(), b"hello");
         let _ = fs::remove_dir_all(root);
     }
 }
