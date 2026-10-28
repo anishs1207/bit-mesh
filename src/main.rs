@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use bit_mesh::{
     DEFAULT_CHUNK_SIZE,
-    dht::Peer,
+    dht::{Peer, distance, key_id},
     manifest::{ChunkRef, Manifest},
     network::{self, Request, Response},
     store::{Lease, Store},
@@ -35,6 +35,8 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:7400")]
         listen: SocketAddr,
+        #[arg(long, value_delimiter = ',')]
+        peers: Vec<SocketAddr>,
     },
     Upload {
         file: PathBuf,
@@ -83,9 +85,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let store = Store::open(&cli.data, cli.quota)?;
     match cli.command {
-        Command::Serve { listen } => {
+        Command::Serve { listen, peers } => {
             println!("bitmesh node listening on {listen}");
-            network::serve(listen, store, 128).await
+            network::serve_with_peers(listen, store, 128, &peers).await
         }
         Command::Upload {
             file,
@@ -246,10 +248,11 @@ async fn replicate(
         }
     }
     for (content, providers) in placements {
-        for seed in peers {
+        let routing = discover_peers(&content, peers).await;
+        for seed in &routing {
             for address in &providers {
                 let _ = network::request(
-                    *seed,
+                    seed.address,
                     Request::AnnounceProvider {
                         content: content.clone(),
                         peer: Peer::from_address(*address, 0),
@@ -262,19 +265,62 @@ async fn replicate(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, net::TcpListener as StdTcpListener};
+
+    fn free_address() -> SocketAddr {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    #[tokio::test]
+    async fn discovers_chunk_holder_through_routing_peer() {
+        let root = std::env::temp_dir().join(format!("bitmesh-lookup-test-{}", std::process::id()));
+        let middle = free_address();
+        let holder = free_address();
+        let a = Store::open(root.join("middle"), 100).unwrap();
+        let b = Store::open(root.join("holder"), 100).unwrap();
+        let bytes = b"through a routing peer";
+        let id = bit_mesh::manifest::hash_bytes(bytes);
+        b.put_chunk(&id, bytes).unwrap();
+        let middle_task = tokio::spawn(async move {
+            network::serve_with_peers(middle, a, 4, &[holder]).await
+        });
+        let holder_task = tokio::spawn(network::serve(holder, b, 4));
+        for _ in 0..30 {
+            if matches!(
+                network::request(middle, Request::Ping).await,
+                Ok(Response::Pong)
+            ) && matches!(
+                network::request(holder, Request::Ping).await,
+                Ok(Response::Pong)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let sources = probe_sources(&id, &[middle]).await;
+        assert!(sources.iter().any(|peer| peer.address == holder));
+        middle_task.abort();
+        holder_task.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
 async fn probe_sources(hash: &str, peers: &[SocketAddr]) -> Vec<Peer> {
-    let mut candidates: HashMap<_, _> = peers
+    let discovered = discover_peers(hash, peers).await;
+    let mut candidates: HashMap<_, _> = discovered
         .iter()
-        .copied()
-        .map(|address| {
-            let peer = Peer::from_address(address, 0);
-            (peer.id, peer)
-        })
+        .cloned()
+        .map(|peer| (peer.id, peer))
         .collect();
     let mut lookups = tokio::task::JoinSet::new();
-    for seed in peers.iter().copied() {
+    for seed in discovered {
         let hash = hash.to_owned();
-        lookups.spawn(async move { network::request(seed, Request::FindProviders(hash)).await });
+        lookups
+            .spawn(async move { network::request_peer(&seed, Request::FindProviders(hash)).await });
     }
     while let Some(result) = lookups.join_next().await {
         if let Ok(Ok(Response::Providers(providers))) = result {
@@ -301,6 +347,47 @@ async fn probe_sources(hash: &str, peers: &[SocketAddr]) -> Vec<Peer> {
         }
     }
     sources
+}
+
+async fn discover_peers(key: &str, seeds: &[SocketAddr]) -> Vec<Peer> {
+    let target = key_id(key);
+    let mut known: HashMap<_, _> = seeds
+        .iter()
+        .copied()
+        .map(|address| {
+            let peer = Peer::from_address(address, 0);
+            (peer.id, peer)
+        })
+        .collect();
+    let mut queried = HashSet::new();
+    while queried.len() < 64 {
+        let mut next: Vec<_> = known
+            .values()
+            .filter(|peer| !queried.contains(&peer.id))
+            .cloned()
+            .collect();
+        next.sort_by_key(|peer| distance(&peer.id, &target));
+        next.truncate(3.min(64 - queried.len()));
+        if next.is_empty() {
+            break;
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for peer in next {
+            queried.insert(peer.id);
+            let key = key.to_owned();
+            tasks.spawn(async move { network::request_peer(&peer, Request::FindNode(key)).await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            if let Ok(Ok(Response::Peers(peers))) = result {
+                for peer in peers {
+                    if peer.id == Peer::from_address(peer.address, 0).id && known.len() < 128 {
+                        known.entry(peer.id).or_insert(peer);
+                    }
+                }
+            }
+        }
+    }
+    known.into_values().collect()
 }
 
 async fn fetch_chunk(
@@ -378,6 +465,18 @@ async fn repair(
                 "chunk {} only has {copies}/{desired} confirmed replicas",
                 chunk.hash
             );
+        }
+        for node in discover_peers(&chunk.hash, peers).await {
+            for provider in &sources {
+                let _ = network::request_peer(
+                    &node,
+                    Request::AnnounceProvider {
+                        content: chunk.hash.clone(),
+                        peer: provider.clone(),
+                    },
+                )
+                .await;
+            }
         }
     }
     for peer in peers {

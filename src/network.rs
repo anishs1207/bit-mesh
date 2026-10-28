@@ -27,6 +27,7 @@ pub enum Request {
     PutLease(Lease),
     Status,
     FindProviders(ContentId),
+    FindNode(ContentId),
     AnnounceProvider { content: ContentId, peer: Peer },
     Ping,
 }
@@ -44,6 +45,7 @@ pub enum Response {
     Stored,
     Status(NodeStatus),
     Providers(Vec<Peer>),
+    Peers(Vec<Peer>),
     Pong,
     Error(String),
 }
@@ -88,9 +90,22 @@ pub async fn request_peer(peer: &Peer, request: Request) -> Result<Response> {
     }
 }
 pub async fn serve(addr: SocketAddr, store: Store, max_connections: usize) -> Result<()> {
+    serve_with_peers(addr, store, max_connections, &[]).await
+}
+
+pub async fn serve_with_peers(
+    addr: SocketAddr,
+    store: Store,
+    max_connections: usize,
+    bootstrap: &[SocketAddr],
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let local = Peer::from_address(addr, store.quota());
-    let dht = Arc::new(Mutex::new(Dht::new(local.id, 20)));
+    let mut routing = Dht::new(local.id, 20);
+    for address in bootstrap {
+        routing.add_peer(Peer::from_address(*address, 0));
+    }
+    let dht = Arc::new(Mutex::new(routing));
     let limit = Arc::new(Semaphore::new(max_connections.max(1)));
     loop {
         let (mut stream, _) = listener.accept().await?;
@@ -130,6 +145,15 @@ pub async fn serve(addr: SocketAddr, store: Store, max_connections: usize) -> Re
                                 providers.insert(0, local.clone());
                             }
                             Ok(Response::Providers(providers))
+                        }
+                    }
+                    Ok(Request::FindNode(id)) => {
+                        if let Err(error) = validate_content_id(&id) {
+                            Err(error)
+                        } else {
+                            let mut peers = dht.lock().await.closest(&crate::dht::key_id(&id));
+                            peers.push(local.clone());
+                            Ok(Response::Peers(peers))
                         }
                     }
                     Ok(Request::AnnounceProvider { content, peer }) => {

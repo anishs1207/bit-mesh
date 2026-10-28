@@ -27,7 +27,7 @@ impl Peer {
     }
 }
 
-fn distance(a: &NodeId, b: &NodeId) -> NodeId {
+pub fn distance(a: &NodeId, b: &NodeId) -> NodeId {
     let mut out = [0; 32];
     for i in 0..32 {
         out[i] = a[i] ^ b[i];
