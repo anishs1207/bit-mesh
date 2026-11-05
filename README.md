@@ -26,7 +26,7 @@ cargo run -- --data node-a upload .\large.bin --replication 3 --peers 127.0.0.1:
 ```
 
 The command prints the manifest ID. A downloader only needs one reachable seed;
-provider lookups expand that seed into the known holders for each chunk:
+provider lookups expand that seed into the known manifest and chunk holders:
 
 ```powershell
 cargo run -- --data node-e download <MANIFEST_ID> .\copy.bin --peers 127.0.0.1:7401 --parallel 8 --retries 3
@@ -59,33 +59,45 @@ capacity with `status`, and change the lifetime with `--lease-seconds`.
 `anchor/programs/bitmesh-payments` contains the Anchor escrow program. Its
 `create_lease` instruction derives a lease PDA from payer, provider, and manifest,
 then escrows lamports. After expiry, the provider signs `settle` to receive the
-payment; Anchor closes the account and refunds rent to the payer. Record the
-submitted transaction alongside the local lease:
+payment; Anchor closes the account and refunds rent to the payer. For paid
+storage, run each provider with its Solana key and a finalized RPC endpoint:
 
 ```powershell
-cargo run -- --data node-a upload .\large.bin --replication 2 --peers 127.0.0.1:7401 --payer <SOLANA_PUBKEY> --payment-signature <TRANSACTION_SIGNATURE>
+cargo run -- --data node-b serve --listen 127.0.0.1:7401 --solana-rpc http://127.0.0.1:8899 --provider-pubkey <PROVIDER_PUBKEY>
+cargo run -- --data node-a upload .\large.bin --replication 2 --peers 127.0.0.1:7401 --payer <PAYER_PUBKEY> --solana-rpc http://127.0.0.1:8899 --payment-account 127.0.0.1:7401=<ANCHOR_LEASE_ACCOUNT>
 ```
 
-The CLI treats those fields as an association, not an RPC confirmation. A
-deployment should verify the transaction and lease PDA against its chosen Solana
-cluster before accepting storage.
+Create each Anchor lease for the exact manifest ID, provider key, and desired
+expiry before uploading. The uploader and paid provider independently query the
+finalized account and check its owner, Anchor discriminator, payer, provider,
+manifest, escrow amount, and expiry. Each replica needs its own lease account.
+To pay a replacement during repair, pass its address and lease account with
+`repair --payment-account PEER=ACCOUNT --solana-rpc RPC`. Paid nodes only accept
+chunk bytes referenced by an active verified lease. The built-in RPC client uses
+plain HTTP, suitable for local Solana validators. For remote clusters, terminate
+TLS at a trusted local proxy and point `--solana-rpc` to that proxy.
+
+The older `--payment-signature` option is metadata only for unconfigured local
+nodes; use `--payment-account` for verified payments.
 
 ## Design and boundaries
 
 - Provider records expire after 15 minutes and are ordered by Kademlia XOR
-  distance. Downloads follow routing contacts from seeds, deduplicate discovered node IDs, probe them in
-  parallel, prioritize rare chunks, and naturally try quick responders first.
-- A peer record can carry a fallback endpoint. Requests try the direct address
-  first and then that endpoint. The current protocol does not implement a relay
-  tunnel for nodes behind NAT.
+  distance. Routing contacts use bounded distance buckets, persist in
+  `routing.json`, and are refreshed every five minutes. Downloads follow routing
+  contacts from seeds, probe providers in parallel, prioritize rare chunks, and
+  rank peers by observed speed, failures, and current requests.
+- A node can use `serve --relay RELAY_ADDRESS --peers RELAY_ADDRESS` to maintain
+  an outbound tunnel to a publicly reachable relay node. Requests try the direct
+  address first and then the tunnel. This works for nodes that cannot accept
+  inbound connections; automatic hole punching is not implemented.
 - Writes are atomic and serialized for quota accounting. Content IDs are strictly
   validated, and corrupt local or remote bytes are rejected.
-- The routing table is a compact XOR-distance table with iterative lookups, not
-  a full Kademlia implementation with bucket refresh and persistent contacts.
 - The JSON-over-TCP protocol is intentionally small. Internet deployment still
-  requires authenticated/encrypted transport, signed provider announcements,
-  durable routing tables, a real relay/TURN service, and on-chain transaction
-  verification. Payment metadata recorded by the CLI is not proof of payment.
+  requires authenticated/encrypted transport and signed peer and provider
+  announcements. Relay registrations currently trust the registering peer's
+  claimed address, so use trusted relays or add identity authentication before
+  exposing them publicly.
 
 Run the core tests with `cargo test --all --all-targets`. Run the Anchor program
 tests with `cargo test --manifest-path anchor/programs/bitmesh-payments/Cargo.toml`.

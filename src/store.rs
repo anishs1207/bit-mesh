@@ -1,8 +1,9 @@
+use crate::dht::Peer;
 use crate::manifest::{ContentId, Manifest, hash_bytes, validate_content_id};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -20,6 +21,10 @@ pub struct Lease {
     pub replication: usize,
     pub payer: Option<String>,
     pub payment_signature: Option<String>,
+    #[serde(default)]
+    pub payment_account: Option<String>,
+    #[serde(default)]
+    pub replica_payments: HashMap<std::net::SocketAddr, String>,
 }
 
 #[derive(Clone)]
@@ -56,6 +61,20 @@ impl Store {
     }
     pub fn quota(&self) -> u64 {
         self.quota
+    }
+    pub fn routing_peers(&self) -> Result<Vec<Peer>> {
+        let path = self.root.join("routing.json");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        Ok(serde_json::from_slice(&fs::read(path)?)?)
+    }
+    pub fn save_routing_peers(&self, peers: &[Peer]) -> Result<()> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("storage write lock poisoned"))?;
+        atomic_replace(&self.root.join("routing.json"), &serde_json::to_vec(peers)?)
     }
 
     pub fn available(&self) -> Result<u64> {
@@ -143,8 +162,12 @@ impl Store {
         if lease.expires_at <= SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() {
             bail!("lease expiry must be in the future");
         }
-        if lease.payer.is_some() != lease.payment_signature.is_some() {
-            bail!("payer and payment signature must be supplied together");
+        if lease.payer.is_some()
+            != (lease.payment_signature.is_some()
+                || lease.payment_account.is_some()
+                || !lease.replica_payments.is_empty())
+        {
+            bail!("payer and payment reference must be supplied together");
         }
         self.get_manifest(&lease.manifest)
             .context("lease references an unavailable manifest")?;
@@ -169,6 +192,15 @@ impl Store {
             }
         }
         Ok(leases)
+    }
+    pub fn has_active_lease_for_chunk(&self, hash: &str) -> Result<bool> {
+        for lease in self.active_leases()? {
+            let manifest = self.get_manifest(&lease.manifest)?;
+            if manifest.chunks.iter().any(|chunk| chunk.hash == hash) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     pub fn garbage_collect(&self) -> Result<(usize, u64)> {
         let _guard = self

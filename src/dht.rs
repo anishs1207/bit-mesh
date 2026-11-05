@@ -1,7 +1,7 @@
 use crate::manifest::ContentId;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     time::{Duration, Instant},
 };
@@ -47,12 +47,12 @@ fn sha2_bytes(bytes: &[u8]) -> NodeId {
     Sha256::digest(bytes).into()
 }
 
-/// Compact Kademlia routing/provider table. Network RPCs live in `network`;
-/// this type implements XOR-distance selection and expiring provider records.
+/// Kademlia routing table with one bounded, least-recently-seen bucket per
+/// distance prefix. Network RPCs live in `network`.
 pub struct Dht {
     local_id: NodeId,
     k: usize,
-    peers: BTreeMap<NodeId, Peer>,
+    buckets: Vec<VecDeque<Peer>>,
     providers: HashMap<ContentId, Vec<(Peer, Instant)>>,
 }
 
@@ -61,17 +61,42 @@ impl Dht {
         Self {
             local_id,
             k: k.max(1),
-            peers: BTreeMap::new(),
+            buckets: vec![VecDeque::new(); 256],
             providers: HashMap::new(),
         }
     }
     pub fn add_peer(&mut self, peer: Peer) {
-        if peer.id != self.local_id {
-            self.peers.insert(peer.id, peer);
+        if let Some(index) = bucket_index(&self.local_id, &peer.id) {
+            let bucket = &mut self.buckets[index];
+            if let Some(position) = bucket.iter().position(|existing| existing.id == peer.id) {
+                bucket.remove(position);
+            } else if bucket.len() == self.k {
+                bucket.pop_front();
+            }
+            bucket.push_back(peer);
         }
     }
+    pub fn remove_peer(&mut self, id: &NodeId) {
+        if let Some(index) = bucket_index(&self.local_id, id) {
+            self.buckets[index].retain(|peer| &peer.id != id);
+        }
+    }
+    pub fn known_peers(&self) -> Vec<Peer> {
+        self.buckets
+            .iter()
+            .flat_map(|bucket| bucket.iter().cloned())
+            .collect()
+    }
+    pub fn peer(&self, id: &NodeId) -> Option<Peer> {
+        bucket_index(&self.local_id, id).and_then(|index| {
+            self.buckets[index]
+                .iter()
+                .find(|peer| &peer.id == id)
+                .cloned()
+        })
+    }
     pub fn closest(&self, target: &NodeId) -> Vec<Peer> {
-        let mut peers: Vec<_> = self.peers.values().cloned().collect();
+        let mut peers = self.known_peers();
         peers.sort_by_key(|p| distance(&p.id, target));
         peers.truncate(self.k);
         peers
@@ -92,6 +117,14 @@ impl Dht {
         providers.truncate(self.k);
         providers
     }
+}
+
+fn bucket_index(local: &NodeId, other: &NodeId) -> Option<usize> {
+    distance(local, other)
+        .iter()
+        .enumerate()
+        .find(|(_, byte)| **byte != 0)
+        .map(|(byte_index, byte)| byte_index * 8 + byte.leading_zeros() as usize)
 }
 
 #[cfg(test)]
@@ -135,5 +168,18 @@ mod tests {
         d.announce(key.clone(), far, Duration::from_secs(10));
         d.announce(key.clone(), close.clone(), Duration::from_secs(10));
         assert_eq!(d.providers(&key), vec![close]);
+    }
+
+    #[test]
+    fn bucket_eviction_keeps_recent_contact() {
+        let mut d = Dht::new([0; 32], 1);
+        let mut old = Peer::from_address("127.0.0.1:1".parse().unwrap(), 1);
+        old.id = [0x80; 32];
+        let mut recent = Peer::from_address("127.0.0.1:2".parse().unwrap(), 1);
+        recent.id = [0x81; 32];
+        d.add_peer(old.clone());
+        d.add_peer(recent.clone());
+        assert!(d.peer(&old.id).is_none());
+        assert_eq!(d.peer(&recent.id), Some(recent));
     }
 }
