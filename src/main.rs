@@ -491,7 +491,6 @@ async fn replicate_paid(
                 continue;
             }
             let mut remote_lease = lease.clone();
-            remote_lease.replica_payments.clear();
             remote_lease.payer = payer.map(str::to_owned);
             remote_lease.payment_account = paid.get(peer).cloned();
             if !matches!(
@@ -576,7 +575,6 @@ async fn replicate_paid(
                 bail!("failed to publish manifest to replica {peer}");
             }
             let mut remote_lease = lease.clone();
-            remote_lease.replica_payments.clear();
             if let Some(account) = paid.get(peer) {
                 remote_lease.payer = payer.map(str::to_owned);
                 remote_lease.payment_account = Some(account.clone());
@@ -723,6 +721,66 @@ mod tests {
         assert!(new_store.has_chunk(&hash));
         assert_eq!(new_store.garbage_collect().unwrap().0, 0);
         first_task.abort();
+        replacement_task.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn repair_works_when_coordinator_has_no_chunk_capacity() {
+        let root =
+            std::env::temp_dir().join(format!("bitmesh-no-local-copy-{}", std::process::id()));
+        let holder = free_address();
+        let replacement = free_address();
+        let coordinator = Store::open(root.join("coordinator"), 0).unwrap();
+        let holder_store = Store::open(root.join("holder"), 100).unwrap();
+        let replacement_store = Store::open(root.join("replacement"), 100).unwrap();
+        let bytes = b"replicated without a local copy";
+        let hash = bit_mesh::manifest::hash_bytes(bytes);
+        holder_store.put_chunk(&hash, bytes).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            name: "file".into(),
+            size: bytes.len() as u64,
+            chunk_size: bytes.len(),
+            chunks: vec![ChunkRef {
+                hash: hash.clone(),
+                size: bytes.len() as u64,
+            }],
+            created_at: 0,
+        };
+        let id = coordinator.put_manifest(&manifest).unwrap();
+        coordinator
+            .put_lease(&Lease {
+                manifest: id,
+                expires_at: u64::MAX,
+                replication: 2,
+                payer: None,
+                payment_signature: None,
+                payment_account: None,
+                replica_payments: HashMap::new(),
+            })
+            .unwrap();
+        let holder_task = tokio::spawn(network::serve(holder, holder_store, 4));
+        let replacement_task =
+            tokio::spawn(network::serve(replacement, replacement_store.clone(), 4));
+        for _ in 0..30 {
+            if matches!(
+                network::request(holder, Request::Ping).await,
+                Ok(Response::Pong)
+            ) && matches!(
+                network::request(replacement, Request::Ping).await,
+                Ok(Response::Pong)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        repair(&coordinator, &manifest, 2, &[holder, replacement])
+            .await
+            .unwrap();
+        assert!(!coordinator.has_chunk(&hash));
+        assert!(replacement_store.has_chunk(&hash));
+        holder_task.abort();
         replacement_task.abort();
         let _ = fs::remove_dir_all(root);
     }
@@ -904,7 +962,6 @@ async fn fetch_chunk(
             if bytes.len() as u64 == chunk.size
                 && bit_mesh::manifest::hash_bytes(&bytes) == chunk.hash
             {
-                store.put_chunk(&chunk.hash, &bytes)?;
                 return Ok(bytes);
             }
         }
@@ -957,7 +1014,6 @@ async fn repair_paid(
                 continue;
             }
             let mut remote_lease = lease.clone();
-            remote_lease.replica_payments.clear();
             remote_lease.payment_account = lease.replica_payments.get(peer).cloned();
             if !matches!(
                 request_address(*peer, &contacts, Request::PutLease(remote_lease)).await,
@@ -973,12 +1029,16 @@ async fn repair_paid(
     };
     for chunk in &manifest.chunks {
         let bytes = fetch_chunk(store, chunk, peers, peers.len().max(1)).await?;
+        if !store.has_chunk(&chunk.hash) && store.available()? >= chunk.size {
+            let _ = store.put_chunk(&chunk.hash, &bytes);
+        }
+        let local_copy = usize::from(store.has_chunk(&chunk.hash));
         let mut sources: Vec<_> = probe_sources(&chunk.hash, peers)
             .await
             .into_iter()
             .filter(|source| eligible.contains(&source.address))
             .collect();
-        let mut copies = 1 + sources.len();
+        let mut copies = local_copy + sources.len();
         let mut attempted: HashSet<_> = sources.iter().map(|source| source.address).collect();
         for peer in &eligible {
             if copies >= desired {
@@ -1037,7 +1097,6 @@ async fn repair_paid(
             Ok(Response::Stored)
         ) {
             let mut remote_lease = lease.clone();
-            remote_lease.replica_payments.clear();
             remote_lease.payment_account = lease.replica_payments.get(peer).cloned();
             if !matches!(
                 request_address(*peer, &contacts, Request::PutLease(remote_lease)).await,

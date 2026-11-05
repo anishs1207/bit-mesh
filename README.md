@@ -43,7 +43,7 @@ Repair obtains a surviving valid copy, checks reported capacity, restores the
 requested number of distinct replicas, and republishes the manifest. It fails
 explicitly if too few valid sources or destinations remain.
 
-To check and repair active leases periodically, serve the uploader's data directory:
+To check and repair active leases periodically, serve any lease holder's data directory:
 
 ```powershell
 cargo run -- --data node-a serve --listen 127.0.0.1:7400 --peers 127.0.0.1:7401,127.0.0.1:7402,127.0.0.1:7403 --repair-interval-seconds 60
@@ -85,6 +85,8 @@ To pay a replacement during repair, pass its address and lease account with
 chunk bytes referenced by an active verified lease. The built-in RPC client uses
 plain HTTP, suitable for local Solana validators. For remote clusters, terminate
 TLS at a trusted local proxy and point `--solana-rpc` to that proxy.
+Lease holders retain the payment account map so a surviving holder can coordinate
+repair if the uploader is offline, provided a paid replacement is configured.
 
 ## Design and boundaries
 
