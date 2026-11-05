@@ -60,15 +60,24 @@ capacity with `status`, and change the lifetime with `--lease-seconds`.
 `create_lease` instruction derives a lease PDA from payer, provider, and manifest,
 then escrows lamports. After expiry, the provider signs `settle` to receive the
 payment; Anchor closes the account and refunds rent to the payer. For paid
-storage, run each provider with its Solana key and a finalized RPC endpoint:
+storage, prepare the file first to obtain its immutable manifest ID:
+
+```powershell
+cargo run -- --data node-a prepare .\large.bin
+```
+
+Create a separate Anchor lease account for each provider, using that manifest
+ID and an expiry at least `--lease-seconds` beyond the planned upload time.
+Then start each provider with its Solana key and a finalized RPC endpoint, and
+publish the prepared file:
 
 ```powershell
 cargo run -- --data node-b serve --listen 127.0.0.1:7401 --solana-rpc http://127.0.0.1:8899 --provider-pubkey <PROVIDER_PUBKEY>
-cargo run -- --data node-a upload .\large.bin --replication 2 --peers 127.0.0.1:7401 --payer <PAYER_PUBKEY> --solana-rpc http://127.0.0.1:8899 --payment-account 127.0.0.1:7401=<ANCHOR_LEASE_ACCOUNT>
+cargo run -- --data node-a upload .\large.bin --prepared-manifest <MANIFEST_ID> --replication 2 --peers 127.0.0.1:7401 --payer <PAYER_PUBKEY> --solana-rpc http://127.0.0.1:8899 --payment-account 127.0.0.1:7401=<ANCHOR_LEASE_ACCOUNT>
 ```
 
-Create each Anchor lease for the exact manifest ID, provider key, and desired
-expiry before uploading. The uploader and paid provider independently query the
+The uploader checks the file against the prepared manifest. The uploader and
+paid provider independently query the
 finalized account and check its owner, Anchor discriminator, payer, provider,
 manifest, escrow amount, and expiry. Each replica needs its own lease account.
 To pay a replacement during repair, pass its address and lease account with
@@ -76,9 +85,6 @@ To pay a replacement during repair, pass its address and lease account with
 chunk bytes referenced by an active verified lease. The built-in RPC client uses
 plain HTTP, suitable for local Solana validators. For remote clusters, terminate
 TLS at a trusted local proxy and point `--solana-rpc` to that proxy.
-
-The older `--payment-signature` option is metadata only for unconfigured local
-nodes; use `--payment-account` for verified payments.
 
 ## Design and boundaries
 

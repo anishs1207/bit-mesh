@@ -120,10 +120,17 @@ enum Command {
         #[arg(long)]
         repair_interval_seconds: Option<u64>,
     },
+    Prepare {
+        file: PathBuf,
+        #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
+        chunk_size: usize,
+    },
     Upload {
         file: PathBuf,
         #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
         chunk_size: usize,
+        #[arg(long)]
+        prepared_manifest: Option<String>,
         #[arg(long, default_value_t = 2)]
         replication: usize,
         #[arg(long, value_delimiter = ',')]
@@ -132,8 +139,6 @@ enum Command {
         lease_seconds: u64,
         #[arg(long)]
         payer: Option<String>,
-        #[arg(long)]
-        payment_signature: Option<String>,
         #[arg(long)]
         solana_rpc: Option<String>,
         #[arg(long = "payment-account")]
@@ -236,21 +241,51 @@ async fn main() -> Result<()> {
             println!("bitmesh node listening on {listen}");
             network::serve_configured(listen, store, 128, &peers, relay, payment).await
         }
-        Command::Upload {
-            file,
-            chunk_size,
-            replication,
-            peers,
-            lease_seconds,
-            payer,
-            payment_signature,
-            solana_rpc,
-            payment_accounts,
-        } => {
+        Command::Prepare { file, chunk_size } => {
             let manifest = Manifest::from_file_with(&file, chunk_size, |reference, bytes| {
                 store.put_chunk(&reference.hash, bytes)?;
                 Ok(())
             })?;
+            println!("{}", store.put_manifest(&manifest)?);
+            Ok(())
+        }
+        Command::Upload {
+            file,
+            chunk_size,
+            prepared_manifest,
+            replication,
+            peers,
+            lease_seconds,
+            payer,
+            solana_rpc,
+            payment_accounts,
+        } => {
+            if solana_rpc.is_some() && prepared_manifest.is_none() {
+                bail!(
+                    "paid upload requires --prepared-manifest; run prepare before creating Anchor leases"
+                );
+            }
+            if payer.is_some() != solana_rpc.is_some() {
+                bail!("--payer and --solana-rpc must be supplied together");
+            }
+            let prepared = prepared_manifest
+                .as_deref()
+                .map(|id| store.get_manifest(id))
+                .transpose()?;
+            let read_chunk_size = prepared.as_ref().map_or(chunk_size, |m| m.chunk_size);
+            let generated =
+                Manifest::from_file_with(&file, read_chunk_size, |reference, bytes| {
+                    store.put_chunk(&reference.hash, bytes)?;
+                    Ok(())
+                })?;
+            let manifest = if let Some(manifest) = prepared {
+                if generated.chunks != manifest.chunks || generated.size != manifest.size {
+                    bail!("file bytes do not match prepared manifest");
+                }
+                manifest
+            } else {
+                generated
+            };
             let id = store.put_manifest(&manifest)?;
             let expiry = SystemTime::now()
                 .duration_since(UNIX_EPOCH)?
@@ -262,9 +297,6 @@ async fn main() -> Result<()> {
             }
             if let Some(rpc) = &solana_rpc {
                 let payer = payer.as_deref().context("paid upload requires --payer")?;
-                if payment_signature.is_some() {
-                    bail!("use --payment-account for verified Anchor escrow");
-                }
                 let contacts = contact_map(&id, &peers).await;
                 let mut verified = HashMap::new();
                 for (peer, account) in &paid {
@@ -302,11 +334,7 @@ async fn main() -> Result<()> {
                 expires_at: expiry,
                 replication,
                 payer: payer.clone(),
-                payment_signature: if solana_rpc.is_some() {
-                    None
-                } else {
-                    payment_signature
-                },
+                payment_signature: None,
                 payment_account: None,
                 replica_payments: paid.clone(),
             };
