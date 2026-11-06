@@ -1,7 +1,20 @@
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
+use solana_sdk::{
+    hash::Hash,
+    instruction::{AccountMeta, Instruction},
+    pubkey::Pubkey,
+    signature::{Signer, read_keypair_file},
+    system_program,
+    transaction::Transaction,
+};
+use std::{
+    path::Path,
+    str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -16,6 +29,132 @@ pub struct PaymentClaim<'a> {
     pub provider: &'a str,
     pub manifest: &'a str,
     pub expires_at: u64,
+}
+
+pub struct CreatedLease {
+    pub account: String,
+    pub signature: String,
+}
+
+pub async fn create_lease(
+    rpc: &str,
+    keypair_path: &Path,
+    provider: &str,
+    manifest: &str,
+    expires_at: i64,
+    amount: u64,
+) -> Result<CreatedLease> {
+    let payer = read_keypair_file(keypair_path)
+        .map_err(|error| anyhow::anyhow!("read payer keypair: {error}"))?;
+    let provider = Pubkey::from_str(provider).context("invalid provider public key")?;
+    let program = Pubkey::from_str(PROGRAM_ID)?;
+    let manifest_bytes: [u8; 32] = hex::decode(manifest)
+        .context("invalid manifest ID")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("manifest ID must contain 32 bytes"))?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    if amount == 0
+        || manifest_bytes == [0; 32]
+        || provider == payer.pubkey()
+        || expires_at <= now
+        || expires_at > now.saturating_add(365 * 24 * 60 * 60)
+    {
+        bail!("invalid Anchor lease amount, manifest, provider, or expiry");
+    }
+    let (lease, instruction) = create_lease_instruction(
+        payer.pubkey(),
+        provider,
+        manifest_bytes,
+        expires_at,
+        amount,
+        program,
+    );
+    let blockhash_response = rpc_call(
+        rpc,
+        "getLatestBlockhash",
+        json!([{"commitment":"finalized"}]),
+    )
+    .await?;
+    let blockhash = blockhash_response["result"]["value"]["blockhash"]
+        .as_str()
+        .context("Solana RPC returned no recent blockhash")?;
+    let blockhash = Hash::from_str(blockhash)?;
+    let mut transaction = Transaction::new_with_payer(&[instruction], Some(&payer.pubkey()));
+    transaction.try_sign(&[&payer], blockhash)?;
+    let encoded = STANDARD.encode(bincode::serialize(&transaction)?);
+    let response = rpc_call(
+        rpc,
+        "sendTransaction",
+        json!([encoded, {"encoding":"base64","preflightCommitment":"confirmed"}]),
+    )
+    .await?;
+    let signature = response["result"]
+        .as_str()
+        .context("Solana RPC returned no transaction signature")?
+        .to_owned();
+    for _ in 0..60 {
+        let response = rpc_call(
+            rpc,
+            "getSignatureStatuses",
+            json!([[signature], {"searchTransactionHistory":true}]),
+        )
+        .await?;
+        let status = &response["result"]["value"][0];
+        if !status.is_null() {
+            if !status["err"].is_null() {
+                bail!("Anchor lease transaction failed: {}", status["err"]);
+            }
+            if status["confirmationStatus"] == "finalized" {
+                verify_lease(
+                    rpc,
+                    &PaymentClaim {
+                        account: &lease.to_string(),
+                        payer: &payer.pubkey().to_string(),
+                        provider: &provider.to_string(),
+                        manifest,
+                        expires_at: expires_at as u64,
+                    },
+                )
+                .await?;
+                return Ok(CreatedLease {
+                    account: lease.to_string(),
+                    signature,
+                });
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    bail!("Anchor lease transaction was sent but did not finalize; signature {signature}")
+}
+
+fn create_lease_instruction(
+    payer: Pubkey,
+    provider: Pubkey,
+    manifest_bytes: [u8; 32],
+    expires_at: i64,
+    amount: u64,
+    program: Pubkey,
+) -> (Pubkey, Instruction) {
+    let (lease, _) = Pubkey::find_program_address(
+        &[b"lease", payer.as_ref(), provider.as_ref(), &manifest_bytes],
+        &program,
+    );
+    let mut data = Vec::with_capacity(56);
+    data.extend_from_slice(&Sha256::digest(b"global:create_lease")[..8]);
+    data.extend_from_slice(&manifest_bytes);
+    data.extend_from_slice(&expires_at.to_le_bytes());
+    data.extend_from_slice(&amount.to_le_bytes());
+    let instruction = Instruction {
+        program_id: program,
+        accounts: vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new_readonly(provider, false),
+            AccountMeta::new(lease, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+        data,
+    };
+    (lease, instruction)
 }
 
 pub async fn verify_lease(rpc: &str, claim: &PaymentClaim<'_>) -> Result<()> {
@@ -61,6 +200,15 @@ pub async fn verify_lease(rpc: &str, claim: &PaymentClaim<'_>) -> Result<()> {
 }
 
 async fn rpc_account(rpc: &str, account: &str) -> Result<Value> {
+    rpc_call(
+        rpc,
+        "getAccountInfo",
+        json!([account,{"encoding":"base64","commitment":"finalized"}]),
+    )
+    .await
+}
+
+async fn rpc_call(rpc: &str, method: &str, params: Value) -> Result<Value> {
     let endpoint = rpc
         .strip_prefix("http://")
         .context("Solana RPC must use http://; put a TLS proxy in front for remote use")?;
@@ -70,9 +218,7 @@ async fn rpc_account(rpc: &str, account: &str) -> Result<Value> {
     } else {
         format!("{authority}:80")
     };
-    let body = json!({"jsonrpc":"2.0","id":1,"method":"getAccountInfo",
-        "params":[account,{"encoding":"base64","commitment":"finalized"}]})
-    .to_string();
+    let body = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
     let request = format!(
         "POST /{path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -166,6 +312,35 @@ mod tests {
         );
         assert_eq!(decode_base64("YWJj").unwrap(), b"abc");
         assert!(decode_base58_32("0").is_err());
+    }
+
+    #[test]
+    fn creates_anchor_lease_instruction_with_expected_accounts_and_data() {
+        let payer = Pubkey::new_unique();
+        let provider = Pubkey::new_unique();
+        let program = Pubkey::from_str(PROGRAM_ID).unwrap();
+        let manifest = [7u8; 32];
+        let (lease, instruction) =
+            create_lease_instruction(payer, provider, manifest, 12345, 678, program);
+        assert_eq!(instruction.program_id, program);
+        assert_eq!(instruction.accounts.len(), 4);
+        assert_eq!(instruction.accounts[0], AccountMeta::new(payer, true));
+        assert_eq!(
+            instruction.accounts[1],
+            AccountMeta::new_readonly(provider, false)
+        );
+        assert_eq!(instruction.accounts[2], AccountMeta::new(lease, false));
+        assert_eq!(
+            instruction.accounts[3],
+            AccountMeta::new_readonly(system_program::id(), false)
+        );
+        assert_eq!(
+            &instruction.data[..8],
+            &Sha256::digest(b"global:create_lease")[..8]
+        );
+        assert_eq!(&instruction.data[8..40], &manifest);
+        assert_eq!(&instruction.data[40..48], &12345i64.to_le_bytes());
+        assert_eq!(&instruction.data[48..56], &678u64.to_le_bytes());
     }
 
     #[tokio::test]

@@ -127,6 +127,19 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
         chunk_size: usize,
     },
+    Pay {
+        manifest: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        keypair: PathBuf,
+        #[arg(long)]
+        expires_at: i64,
+        #[arg(long)]
+        amount_lamports: u64,
+        #[arg(long)]
+        solana_rpc: String,
+    },
     Upload {
         file: PathBuf,
         #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
@@ -267,6 +280,27 @@ async fn main() -> Result<()> {
                 Ok(())
             })?;
             println!("{}", store.put_manifest(&manifest)?);
+            Ok(())
+        }
+        Command::Pay {
+            manifest,
+            provider,
+            keypair,
+            expires_at,
+            amount_lamports,
+            solana_rpc,
+        } => {
+            let created = solana::create_lease(
+                &solana_rpc,
+                &keypair,
+                &provider,
+                &manifest,
+                expires_at,
+                amount_lamports,
+            )
+            .await?;
+            println!("payment account: {}", created.account);
+            println!("transaction signature: {}", created.signature);
             Ok(())
         }
         Command::Upload {

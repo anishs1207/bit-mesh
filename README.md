@@ -73,8 +73,15 @@ cargo run -- --data node-a prepare .\large.bin
 
 Create a separate Anchor lease account for each provider, using that manifest
 ID and an expiry at least `--lease-seconds` beyond the planned upload time.
+The `pay` command reads a local Solana keypair, signs the Anchor instruction,
+submits it, and waits for a finalized account:
+
+```powershell
+cargo run -- --data node-a pay <MANIFEST_ID> --provider <PROVIDER_PUBKEY> --keypair .\payer.json --expires-at <UNIX_TIMESTAMP> --amount-lamports 1000000 --solana-rpc http://127.0.0.1:8899
+```
+
 Then start each provider with its Solana key and a finalized RPC endpoint, and
-publish the prepared file:
+publish the prepared file, using the payment account printed by `pay`:
 
 ```powershell
 cargo run -- --data node-b serve --listen 127.0.0.1:7401 --solana-rpc http://127.0.0.1:8899 --provider-pubkey <PROVIDER_PUBKEY>
