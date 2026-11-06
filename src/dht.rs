@@ -103,9 +103,19 @@ impl Dht {
     }
     pub fn announce(&mut self, key: ContentId, peer: Peer, ttl: Duration) {
         let expiry = Instant::now() + ttl;
+        let target = key_id(&key);
         let records = self.providers.entry(key).or_default();
-        records.retain(|(p, _)| p.id != peer.id);
+        records.retain(|(p, until)| p.id != peer.id && *until > Instant::now());
         records.push((peer, expiry));
+        records.sort_by_key(|(peer, _)| distance(&peer.id, &target));
+        records.truncate(self.k);
+    }
+    pub fn prune_expired(&mut self) {
+        let now = Instant::now();
+        self.providers.retain(|_, records| {
+            records.retain(|(_, expiry)| *expiry > now);
+            !records.is_empty()
+        });
     }
     pub fn providers(&mut self, key: &str) -> Vec<Peer> {
         let now = Instant::now();
@@ -168,6 +178,20 @@ mod tests {
         d.announce(key.clone(), far, Duration::from_secs(10));
         d.announce(key.clone(), close.clone(), Duration::from_secs(10));
         assert_eq!(d.providers(&key), vec![close]);
+        assert_eq!(d.providers[&key].len(), 1);
+    }
+
+    #[test]
+    fn expired_provider_records_are_removed() {
+        let mut d = Dht::new([0; 32], 2);
+        let key = hex::encode([3u8; 32]);
+        d.announce(
+            key.clone(),
+            Peer::from_address("127.0.0.1:1".parse().unwrap(), 1),
+            Duration::ZERO,
+        );
+        d.prune_expired();
+        assert!(!d.providers.contains_key(&key));
     }
 
     #[test]

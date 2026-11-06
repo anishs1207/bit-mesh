@@ -254,6 +254,7 @@ pub async fn serve_configured(
                 if let Err(error) = refresh_store.save_routing_peers(&peers) {
                     eprintln!("routing save failed: {error:#}");
                 }
+                refresh_dht.lock().await.prune_expired();
             }
         });
     }
