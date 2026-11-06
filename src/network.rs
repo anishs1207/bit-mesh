@@ -219,7 +219,6 @@ pub async fn serve_configured(
         let refresh_local = local.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
-            interval.tick().await;
             loop {
                 interval.tick().await;
                 let peers = refresh_dht.lock().await.known_peers();
@@ -232,6 +231,26 @@ pub async fn serve_configured(
                     }
                 }
                 let peers = refresh_dht.lock().await.known_peers();
+                match refresh_store.advertised_content() {
+                    Ok(content) => {
+                        for key in content {
+                            let target = crate::dht::key_id(&key);
+                            let mut closest = peers.clone();
+                            closest.sort_by_key(|peer| crate::dht::distance(&peer.id, &target));
+                            for peer in closest.iter().take(20) {
+                                let _ = request_peer(
+                                    peer,
+                                    Request::AnnounceProvider {
+                                        content: key.clone(),
+                                        peer: refresh_local.clone(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!("provider refresh failed: {error:#}"),
+                }
                 if let Err(error) = refresh_store.save_routing_peers(&peers) {
                     eprintln!("routing save failed: {error:#}");
                 }

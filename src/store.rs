@@ -202,6 +202,20 @@ impl Store {
         }
         Ok(false)
     }
+    /// Content this node can truthfully advertise while an active lease pins it.
+    pub fn advertised_content(&self) -> Result<HashSet<ContentId>> {
+        let mut content = HashSet::new();
+        for lease in self.active_leases()? {
+            let manifest = self.get_manifest(&lease.manifest)?;
+            content.insert(lease.manifest);
+            for chunk in manifest.chunks {
+                if self.has_chunk(&chunk.hash) {
+                    content.insert(chunk.hash);
+                }
+            }
+        }
+        Ok(content)
+    }
     pub fn garbage_collect(&self) -> Result<(usize, u64)> {
         let _guard = self
             .write_lock
@@ -355,6 +369,53 @@ mod tests {
         assert!(!store.has_manifest(&id));
         store.put_manifest(&manifest).unwrap();
         assert_eq!(store.get_manifest(&id).unwrap(), manifest);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn advertisements_exclude_missing_and_expired_chunks() {
+        let root = std::env::temp_dir().join(format!(
+            "bitmesh-advertise-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let store = Store::open(&root, 100).unwrap();
+        let present = hash_bytes(b"present");
+        let missing = hash_bytes(b"missing");
+        store.put_chunk(&present, b"present").unwrap();
+        let manifest = Manifest {
+            version: 1,
+            name: "two".into(),
+            size: 14,
+            chunk_size: 7,
+            chunks: vec![
+                crate::manifest::ChunkRef {
+                    hash: present.clone(),
+                    size: 7,
+                },
+                crate::manifest::ChunkRef {
+                    hash: missing.clone(),
+                    size: 7,
+                },
+            ],
+            created_at: 0,
+        };
+        let id = store.put_manifest(&manifest).unwrap();
+        store
+            .put_lease(&Lease {
+                manifest: id.clone(),
+                expires_at: u64::MAX,
+                replication: 1,
+                payer: None,
+                payment_signature: None,
+                payment_account: None,
+                replica_payments: HashMap::new(),
+            })
+            .unwrap();
+        let advertised = store.advertised_content().unwrap();
+        assert!(advertised.contains(&id));
+        assert!(advertised.contains(&present));
+        assert!(!advertised.contains(&missing));
         let _ = fs::remove_dir_all(root);
     }
 }
