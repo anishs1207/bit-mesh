@@ -17,6 +17,7 @@ use tokio::{
 const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PROVIDER_TTL: StdDuration = StdDuration::from_secs(15 * 60);
+const ANNOUNCE_BATCH_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
@@ -31,6 +32,10 @@ pub enum Request {
     FindNode(ContentId),
     AnnounceProvider {
         content: ContentId,
+        peer: Peer,
+    },
+    AnnounceProviders {
+        content: Vec<ContentId>,
         peer: Peer,
     },
     RegisterPeer(Peer),
@@ -233,15 +238,25 @@ pub async fn serve_configured(
                 let peers = refresh_dht.lock().await.known_peers();
                 match refresh_store.advertised_content() {
                     Ok(content) => {
+                        let mut batches: HashMap<NodeId, (Peer, Vec<ContentId>)> = HashMap::new();
                         for key in content {
                             let target = crate::dht::key_id(&key);
                             let mut closest = peers.clone();
                             closest.sort_by_key(|peer| crate::dht::distance(&peer.id, &target));
                             for peer in closest.iter().take(20) {
+                                batches
+                                    .entry(peer.id)
+                                    .or_insert_with(|| (peer.clone(), Vec::new()))
+                                    .1
+                                    .push(key.clone());
+                            }
+                        }
+                        for (_, (peer, keys)) in batches {
+                            for chunk in keys.chunks(ANNOUNCE_BATCH_SIZE) {
                                 let _ = request_peer(
-                                    peer,
-                                    Request::AnnounceProvider {
-                                        content: key.clone(),
+                                    &peer,
+                                    Request::AnnounceProviders {
+                                        content: chunk.to_vec(),
                                         peer: refresh_local.clone(),
                                     },
                                 )
@@ -373,6 +388,24 @@ pub async fn serve_configured(
                                 dht.announce(content, peer, PROVIDER_TTL);
                                 Ok(Response::Stored)
                             }
+                        }
+                    }
+                    Ok(Request::AnnounceProviders { content, peer }) => {
+                        if content.len() > ANNOUNCE_BATCH_SIZE {
+                            Err(anyhow::anyhow!("too many provider records in one request"))
+                        } else if peer.id != Peer::from_address(peer.address, 0).id {
+                            Err(anyhow::anyhow!("peer ID does not match address"))
+                        } else if let Some(invalid) =
+                            content.iter().find(|id| validate_content_id(id).is_err())
+                        {
+                            Err(anyhow::anyhow!("invalid content ID {invalid}"))
+                        } else {
+                            let mut dht = dht.lock().await;
+                            dht.add_peer(peer.clone());
+                            for id in content {
+                                dht.announce(id, peer.clone(), PROVIDER_TTL);
+                            }
+                            Ok(Response::Stored)
                         }
                     }
                     Ok(Request::RegisterPeer(peer)) => {
@@ -555,6 +588,59 @@ mod tests {
         assert!(received);
         node_task.abort();
         relay_task.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn batch_announcements_validate_before_storage() {
+        let root = std::env::temp_dir().join(format!(
+            "bitmesh-batch-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let server = tokio::spawn(serve(address, Store::open(&root, 1024).unwrap(), 4));
+        for _ in 0..30 {
+            if matches!(request(address, Request::Ping).await, Ok(Response::Pong)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let peer = Peer::from_address("127.0.0.1:9999".parse().unwrap(), 1024);
+        let id = hash_bytes(b"batch");
+        assert!(matches!(
+            request(
+                address,
+                Request::AnnounceProviders {
+                    content: vec![id.clone(), "invalid".into()],
+                    peer: peer.clone(),
+                }
+            )
+            .await,
+            Ok(Response::Error(_))
+        ));
+        assert!(matches!(
+            request(address, Request::FindProviders(id.clone())).await,
+            Ok(Response::Providers(providers)) if providers.is_empty()
+        ));
+        assert!(matches!(
+            request(
+                address,
+                Request::AnnounceProviders {
+                    content: vec![id.clone()],
+                    peer: peer.clone(),
+                }
+            )
+            .await,
+            Ok(Response::Stored)
+        ));
+        assert!(matches!(
+            request(address, Request::FindProviders(id)).await,
+            Ok(Response::Providers(providers)) if providers == vec![peer]
+        ));
+        server.abort();
         let _ = fs::remove_dir_all(root);
     }
 }
