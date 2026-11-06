@@ -49,6 +49,11 @@ To check and repair active leases periodically, serve any lease holder's data di
 cargo run -- --data node-a serve --listen 127.0.0.1:7400 --peers 127.0.0.1:7401,127.0.0.1:7402,127.0.0.1:7403 --repair-interval-seconds 60
 ```
 
+Add `--gc-interval-seconds 3600` to a serving node to remove chunks after
+their last lease expires. Provider announcements for active, valid local
+content are refreshed every five minutes so they do not disappear when their
+15-minute DHT records expire.
+
 ## Leases and Solana payments
 
 Uploads create storage leases on the uploader and confirmed replica nodes (seven

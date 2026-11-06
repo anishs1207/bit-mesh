@@ -119,6 +119,8 @@ enum Command {
         provider_pubkey: Option<String>,
         #[arg(long)]
         repair_interval_seconds: Option<u64>,
+        #[arg(long)]
+        gc_interval_seconds: Option<u64>,
     },
     Prepare {
         file: PathBuf,
@@ -187,6 +189,7 @@ async fn main() -> Result<()> {
             solana_rpc,
             provider_pubkey,
             repair_interval_seconds,
+            gc_interval_seconds,
         } => {
             let payment = match (solana_rpc, provider_pubkey) {
                 (Some(rpc), Some(provider_pubkey)) => Some(network::PaymentConfig {
@@ -234,6 +237,23 @@ async fn main() -> Result<()> {
                                 }
                             }
                             Err(error) => eprintln!("repair scan failed: {error:#}"),
+                        }
+                    }
+                });
+            }
+            if let Some(seconds) = gc_interval_seconds {
+                if seconds == 0 {
+                    bail!("garbage collection interval must be positive");
+                }
+                let gc_store = store.clone();
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(seconds));
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        if let Err(error) = gc_store.garbage_collect() {
+                            eprintln!("garbage collection failed: {error:#}");
                         }
                     }
                 });
