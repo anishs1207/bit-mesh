@@ -119,6 +119,8 @@ enum Command {
         provider_pubkey: Option<String>,
         #[arg(long)]
         repair_interval_seconds: Option<u64>,
+        #[arg(long = "repair-payment-account")]
+        repair_payment_accounts: Vec<String>,
         #[arg(long)]
         gc_interval_seconds: Option<u64>,
     },
@@ -202,8 +204,10 @@ async fn main() -> Result<()> {
             solana_rpc,
             provider_pubkey,
             repair_interval_seconds,
+            repair_payment_accounts,
             gc_interval_seconds,
         } => {
+            let repair_payments = parse_payment_accounts(&repair_payment_accounts)?;
             let payment = match (solana_rpc, provider_pubkey) {
                 (Some(rpc), Some(provider_pubkey)) => Some(network::PaymentConfig {
                     rpc,
@@ -212,12 +216,16 @@ async fn main() -> Result<()> {
                 (None, None) => None,
                 _ => bail!("serve requires both --solana-rpc and --provider-pubkey"),
             };
+            if !repair_payments.is_empty() && payment.is_none() {
+                bail!("automatic paid repair requires --solana-rpc and --provider-pubkey");
+            }
             if let Some(seconds) = repair_interval_seconds {
                 if seconds == 0 || peers.is_empty() {
                     bail!("automatic repair needs a positive interval and at least one peer");
                 }
                 let repair_store = store.clone();
                 let repair_peers = peers.clone();
+                let repair_payment = payment.clone();
                 tokio::spawn(async move {
                     let mut interval =
                         tokio::time::interval(std::time::Duration::from_secs(seconds));
@@ -229,11 +237,28 @@ async fn main() -> Result<()> {
                                 for lease in leases {
                                     match repair_store.get_manifest(&lease.manifest) {
                                         Ok(manifest) => {
-                                            if let Err(error) = repair(
+                                            let added = match verify_repair_payments(
+                                                &lease,
+                                                &repair_peers,
+                                                &repair_payments,
+                                                repair_payment.as_ref().map(|p| p.rpc.as_str()),
+                                            )
+                                            .await
+                                            {
+                                                Ok(added) => added,
+                                                Err(error) => {
+                                                    eprintln!(
+                                                        "repair payment verification failed: {error:#}"
+                                                    );
+                                                    continue;
+                                                }
+                                            };
+                                            if let Err(error) = repair_paid(
                                                 &repair_store,
                                                 &manifest,
                                                 lease.replication,
                                                 &repair_peers,
+                                                &added,
                                             )
                                             .await
                                             {
@@ -419,53 +444,17 @@ async fn main() -> Result<()> {
             solana_rpc,
         } => {
             let m = store.get_manifest(&manifest)?;
-            let mut added = parse_payment_accounts(&payment_accounts)?;
-            if !added.is_empty() {
-                let rpc = solana_rpc
-                    .as_deref()
-                    .context("new payment accounts require --solana-rpc")?;
-                let local_lease = store
-                    .active_leases()?
-                    .into_iter()
-                    .find(|lease| lease.manifest == manifest)
-                    .context("paid repair requires an active local lease")?;
-                let payer = local_lease
-                    .payer
-                    .as_deref()
-                    .context("paid repair requires a local lease with payer")?;
-                let contacts = contact_map(&manifest, &peers).await;
-                let mut verified = HashMap::new();
-                for (peer, account) in &added {
-                    let provider = match request_address(*peer, &contacts, Request::Status).await {
-                        Ok(Response::Status(status)) => status.provider_pubkey,
-                        _ => None,
-                    };
-                    if let Some(provider) = provider {
-                        match solana::verify_lease(
-                            rpc,
-                            &PaymentClaim {
-                                account,
-                                payer,
-                                provider: &provider,
-                                manifest: &manifest,
-                                expires_at: local_lease.expires_at,
-                            },
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                verified.insert(*peer, account.clone());
-                            }
-                            Err(error) => eprintln!(
-                                "replacement payment lease for {peer} rejected: {error:#}"
-                            ),
-                        }
-                    }
-                }
-                added = verified;
-                if added.is_empty() {
-                    bail!("no replacement payment accounts passed verification");
-                }
+            let requested = parse_payment_accounts(&payment_accounts)?;
+            let local_lease = store
+                .active_leases()?
+                .into_iter()
+                .find(|lease| lease.manifest == manifest)
+                .context("repair requires an active local lease")?;
+            let added =
+                verify_repair_payments(&local_lease, &peers, &requested, solana_rpc.as_deref())
+                    .await?;
+            if !requested.is_empty() && added.is_empty() {
+                bail!("no replacement payment accounts passed verification");
             }
             repair_paid(&store, &m, replication, &peers, &added).await
         }
@@ -489,6 +478,53 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn verify_repair_payments(
+    lease: &Lease,
+    peers: &[SocketAddr],
+    requested: &HashMap<SocketAddr, String>,
+    rpc: Option<&str>,
+) -> Result<HashMap<SocketAddr, String>> {
+    if requested.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rpc = rpc.context("new payment accounts require --solana-rpc")?;
+    let payer = lease
+        .payer
+        .as_deref()
+        .context("paid repair requires a local lease with payer")?;
+    let contacts = contact_map(&lease.manifest, peers).await;
+    let mut verified = HashMap::new();
+    for (peer, account) in requested {
+        if !peers.contains(peer) {
+            continue;
+        }
+        let provider = match request_address(*peer, &contacts, Request::Status).await {
+            Ok(Response::Status(status)) => status.provider_pubkey,
+            _ => None,
+        };
+        if let Some(provider) = provider {
+            match solana::verify_lease(
+                rpc,
+                &PaymentClaim {
+                    account,
+                    payer,
+                    provider: &provider,
+                    manifest: &lease.manifest,
+                    expires_at: lease.expires_at,
+                },
+            )
+            .await
+            {
+                Ok(()) => {
+                    verified.insert(*peer, account.clone());
+                }
+                Err(error) => eprintln!("replacement payment lease for {peer} rejected: {error:#}"),
+            }
+        }
+    }
+    Ok(verified)
 }
 
 fn parse_payment_accounts(values: &[String]) -> Result<HashMap<SocketAddr, String>> {
@@ -836,6 +872,103 @@ mod tests {
         assert!(replacement_store.has_chunk(&hash));
         holder_task.abort();
         replacement_task.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn repairs_after_two_storage_nodes_die() {
+        let root =
+            std::env::temp_dir().join(format!("bitmesh-multiple-failures-{}", std::process::id()));
+        let addresses: Vec<SocketAddr> = (0..5).map(|_| free_address()).collect();
+        let local = Store::open(root.join("local"), 1024).unwrap();
+        let stores: Vec<Store> = (0..5)
+            .map(|index| Store::open(root.join(format!("peer-{index}")), 1024).unwrap())
+            .collect();
+        let mut tasks = Vec::new();
+        for index in 0..3 {
+            tasks.push(tokio::spawn(network::serve(
+                addresses[index],
+                stores[index].clone(),
+                8,
+            )));
+        }
+        for address in &addresses[..3] {
+            for _ in 0..30 {
+                if matches!(
+                    network::request(*address, Request::Ping).await,
+                    Ok(Response::Pong)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        let bytes = b"two distinct chunks survive node failures";
+        let manifest = Manifest::from_file_with(
+            &{
+                fs::create_dir_all(&root).unwrap();
+                let file = root.join("source.bin");
+                fs::write(&file, bytes).unwrap();
+                file
+            },
+            20,
+            |chunk, data| {
+                local.put_chunk(&chunk.hash, data)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        let id = local.put_manifest(&manifest).unwrap();
+        let lease = Lease {
+            manifest: id.clone(),
+            expires_at: u64::MAX,
+            replication: 4,
+            payer: None,
+            payment_signature: None,
+            payment_account: None,
+            replica_payments: HashMap::new(),
+        };
+        replicate(&local, &manifest, &lease, &addresses[..3])
+            .await
+            .unwrap();
+        local.put_lease(&lease).unwrap();
+        tasks[0].abort();
+        tasks[1].abort();
+        for index in 3..5 {
+            tasks.push(tokio::spawn(network::serve(
+                addresses[index],
+                stores[index].clone(),
+                8,
+            )));
+        }
+        for address in &addresses[3..5] {
+            for _ in 0..30 {
+                if matches!(
+                    network::request(*address, Request::Ping).await,
+                    Ok(Response::Pong)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        repair(&local, &manifest, 4, &addresses).await.unwrap();
+        for chunk in &manifest.chunks {
+            assert!(stores[2].has_chunk(&chunk.hash));
+            assert!(stores[3].has_chunk(&chunk.hash));
+            assert!(stores[4].has_chunk(&chunk.hash));
+        }
+        assert_eq!(stores[3].garbage_collect().unwrap().0, 0);
+        assert_eq!(stores[4].garbage_collect().unwrap().0, 0);
+        let downloader = Store::open(root.join("downloader"), 1024).unwrap();
+        let output = root.join("copy.bin");
+        download(&downloader, &id, &output, &addresses[2..5], 2, 3)
+            .await
+            .unwrap();
+        assert_eq!(fs::read(output).unwrap(), bytes);
+        for task in tasks {
+            task.abort();
+        }
         let _ = fs::remove_dir_all(root);
     }
 

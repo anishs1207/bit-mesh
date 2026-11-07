@@ -49,6 +49,15 @@ To check and repair active leases periodically, serve any lease holder's data di
 cargo run -- --data node-a serve --listen 127.0.0.1:7400 --peers 127.0.0.1:7401,127.0.0.1:7402,127.0.0.1:7403 --repair-interval-seconds 60
 ```
 
+For paid leases, fund a replacement provider in advance with `pay`, then pass
+its account to the repair coordinator with
+`serve --repair-payment-account PEER=ACCOUNT`. The coordinator queries the
+replacement provider and verifies the finalized Anchor account for each active
+manifest before using it. Include the replacement address in `--peers`.
+Payment is required for each replacement provider; a node cannot create a
+payment on another user's behalf. The coordinator retains verified replacement
+accounts in the repaired lease for later scans.
+
 Add `--gc-interval-seconds 3600` to a serving node to remove chunks after
 their last lease expires. Provider announcements for active, valid local
 content are refreshed every five minutes so they do not disappear when their
