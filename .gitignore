@@ -1,6 +1,5 @@
 # Private implementation briefs and progress notes
 /prompts/
-/promps/
 
 # Rust and Anchor build output at any workspace depth
 target/

@@ -23,6 +23,7 @@ const ANNOUNCE_BATCH_SIZE: usize = 256;
 pub enum Request {
     GetChunk(ContentId),
     HasChunk(ContentId),
+    HasChunkSized(ContentId, u64),
     GetManifest(ContentId),
     PutChunk(ContentId, Vec<u8>),
     PutManifest(Manifest),
@@ -327,6 +328,11 @@ pub async fn serve_configured_with_relays(
                 Ok(request) => match request {
                     Ok(Request::GetChunk(id)) => store.get_chunk(&id).map(Response::Chunk),
                     Ok(Request::HasChunk(id)) => Ok(Response::Present(store.has_chunk(&id))),
+                    Ok(Request::HasChunkSized(id, size)) => Ok(Response::Present(
+                        store
+                            .get_chunk(&id)
+                            .is_ok_and(|bytes| bytes.len() as u64 == size),
+                    )),
                     Ok(Request::GetManifest(id)) => store.get_manifest(&id).map(Response::Manifest),
                     Ok(Request::PutChunk(id, bytes)) => {
                         match if payment.is_some() {
@@ -522,6 +528,22 @@ mod tests {
         assert!(matches!(
             request(address, Request::GetChunk(id.clone())).await,
             Ok(Response::Chunk(received)) if received == bytes
+        ));
+        assert!(matches!(
+            request(
+                address,
+                Request::HasChunkSized(id.clone(), bytes.len() as u64)
+            )
+            .await,
+            Ok(Response::Present(true))
+        ));
+        assert!(matches!(
+            request(
+                address,
+                Request::HasChunkSized(id.clone(), bytes.len() as u64 + 1)
+            )
+            .await,
+            Ok(Response::Present(false))
         ));
         assert!(matches!(
             request(address, Request::Status).await,

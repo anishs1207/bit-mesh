@@ -259,6 +259,7 @@ async fn main() -> Result<()> {
                                                 lease.replication,
                                                 &repair_peers,
                                                 &added,
+                                                Some(listen),
                                             )
                                             .await
                                             {
@@ -456,7 +457,7 @@ async fn main() -> Result<()> {
             if !requested.is_empty() && added.is_empty() {
                 bail!("no replacement payment accounts passed verification");
             }
-            repair_paid(&store, &m, replication, &peers, &added).await
+            repair_paid(&store, &m, replication, &peers, &added, None).await
         }
         Command::Status { peers } => {
             println!("local: {} / {} bytes used", store.used()?, store.quota());
@@ -608,7 +609,12 @@ async fn replicate_paid(
                 continue;
             }
             if matches!(
-                request_address(*peer, &contacts, Request::HasChunk(chunk.hash.clone())).await,
+                request_address(
+                    *peer,
+                    &contacts,
+                    Request::HasChunkSized(chunk.hash.clone(), chunk.size),
+                )
+                .await,
                 Ok(Response::Present(true))
             ) {
                 copies += 1;
@@ -749,7 +755,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let sources = probe_sources(&id, &[middle]).await;
+        let sources = probe_sources(&id, None, &[middle]).await;
         assert!(sources.iter().any(|peer| peer.address == holder));
         middle_task.abort();
         holder_task.abort();
@@ -850,7 +856,12 @@ mod tests {
                 replica_payments: HashMap::new(),
             })
             .unwrap();
-        let holder_task = tokio::spawn(network::serve(holder, holder_store, 4));
+        let holder_task = tokio::spawn(network::serve_with_peers(
+            holder,
+            holder_store,
+            4,
+            &[replacement],
+        ));
         let replacement_task =
             tokio::spawn(network::serve(replacement, replacement_store.clone(), 4));
         for _ in 0..30 {
@@ -865,9 +876,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        repair(&coordinator, &manifest, 2, &[holder, replacement])
-            .await
-            .unwrap();
+        repair(&coordinator, &manifest, 2, &[holder]).await.unwrap();
         assert!(!coordinator.has_chunk(&hash));
         assert!(replacement_store.has_chunk(&hash));
         holder_task.abort();
@@ -1023,7 +1032,7 @@ mod tests {
     }
 }
 
-async fn probe_sources(hash: &str, peers: &[SocketAddr]) -> Vec<Peer> {
+async fn probe_sources(hash: &str, size: Option<u64>, peers: &[SocketAddr]) -> Vec<Peer> {
     let discovered = discover_peers(hash, peers).await;
     let mut candidates: HashMap<_, _> = discovered
         .iter()
@@ -1047,8 +1056,12 @@ async fn probe_sources(hash: &str, peers: &[SocketAddr]) -> Vec<Peer> {
     for peer in candidates.into_values() {
         let hash = hash.to_owned();
         tasks.spawn(async move {
+            let request = match size {
+                Some(size) => Request::HasChunkSized(hash, size),
+                None => Request::HasChunk(hash),
+            };
             matches!(
-                network::request_peer(&peer, Request::HasChunk(hash)).await,
+                network::request_peer(&peer, request).await,
                 Ok(Response::Present(true))
             )
             .then_some(peer)
@@ -1136,7 +1149,7 @@ async fn request_address(
 async fn fetch_chunk(
     store: &Store,
     chunk: &ChunkRef,
-    peers: &[SocketAddr],
+    sources: &[Peer],
     retries: usize,
 ) -> Result<Vec<u8>> {
     if let Ok(bytes) = store.get_chunk(&chunk.hash) {
@@ -1144,7 +1157,6 @@ async fn fetch_chunk(
             return Ok(bytes);
         }
     }
-    let sources = probe_sources(&chunk.hash, peers).await;
     for peer in sources.iter().cycle().take(retries.max(1)) {
         if let Ok(Response::Chunk(bytes)) =
             network::request_peer(peer, Request::GetChunk(chunk.hash.clone())).await
@@ -1165,7 +1177,7 @@ async fn repair(
     desired: usize,
     peers: &[SocketAddr],
 ) -> Result<()> {
-    repair_paid(store, manifest, desired, peers, &HashMap::new()).await
+    repair_paid(store, manifest, desired, peers, &HashMap::new(), None).await
 }
 
 async fn repair_paid(
@@ -1174,6 +1186,7 @@ async fn repair_paid(
     desired: usize,
     peers: &[SocketAddr],
     added: &HashMap<SocketAddr, String>,
+    coordinator_address: Option<SocketAddr>,
 ) -> Result<()> {
     if desired == 0 {
         bail!("replication must be at least one");
@@ -1186,13 +1199,15 @@ async fn repair_paid(
         .context("repair requires an active local lease")?;
     lease.replica_payments.extend(added.clone());
     let contacts = contact_map(&id, peers).await;
-    let eligible: Vec<_> = peers
-        .iter()
+    let mut eligible: Vec<_> = contacts
+        .keys()
         .copied()
+        .filter(|peer| Some(*peer) != coordinator_address)
         .filter(|peer| {
             lease.replica_payments.is_empty() || lease.replica_payments.contains_key(peer)
         })
         .collect();
+    eligible.sort_unstable();
     lease.replication = desired;
     let eligible = if !lease.replica_payments.is_empty() {
         let mut prepared = Vec::new();
@@ -1218,17 +1233,27 @@ async fn repair_paid(
         eligible
     };
     for chunk in &manifest.chunks {
-        let bytes = fetch_chunk(store, chunk, peers, peers.len().max(1)).await?;
-        if !store.has_chunk(&chunk.hash) && store.available()? >= chunk.size {
-            let _ = store.put_chunk(&chunk.hash, &bytes);
-        }
-        let local_copy = usize::from(store.has_chunk(&chunk.hash));
-        let mut sources: Vec<_> = probe_sources(&chunk.hash, peers)
-            .await
-            .into_iter()
+        let local_copy = usize::from(
+            store
+                .get_chunk(&chunk.hash)
+                .is_ok_and(|bytes| bytes.len() as u64 == chunk.size),
+        );
+        let discovered = probe_sources(&chunk.hash, Some(chunk.size), peers).await;
+        let mut sources: Vec<_> = discovered
+            .iter()
             .filter(|source| eligible.contains(&source.address))
+            .cloned()
             .collect();
         let mut copies = local_copy + sources.len();
+        if copies >= desired {
+            continue;
+        }
+        let bytes = fetch_chunk(store, chunk, &discovered, discovered.len()).await?;
+        if local_copy == 0 && store.available()? >= chunk.size {
+            if store.put_chunk(&chunk.hash, &bytes).is_ok() {
+                copies += 1;
+            }
+        }
         let mut attempted: HashSet<_> = sources.iter().map(|source| source.address).collect();
         for peer in &eligible {
             if copies >= desired {
@@ -1345,13 +1370,17 @@ async fn download(
     let mut discoveries = tokio::task::JoinSet::new();
     let mut missing = HashSet::new();
     for chunk in &manifest.chunks {
-        if !store.has_chunk(&chunk.hash) && missing.insert(chunk.hash.clone()) {
+        let local_valid = store
+            .get_chunk(&chunk.hash)
+            .is_ok_and(|bytes| bytes.len() as u64 == chunk.size);
+        if !local_valid && missing.insert(chunk.hash.clone()) {
             let permit = discovery_limit.clone().acquire_owned().await?;
             let hash = chunk.hash.clone();
+            let chunk_size = chunk.size;
             let seeds = peers.to_vec();
             discoveries.spawn(async move {
                 let _permit = permit;
-                let sources = probe_sources(&hash, &seeds).await;
+                let sources = probe_sources(&hash, Some(chunk_size), &seeds).await;
                 (hash, sources)
             });
         }
@@ -1376,10 +1405,9 @@ async fn download(
         let metrics = metrics.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
-            let bytes = if let Ok(bytes) = store.get_chunk(&chunk.hash) {
-                bytes
-            } else {
-                fetch_from_sources(&chunk, &sources, retries, &metrics).await?
+            let bytes = match store.get_chunk(&chunk.hash) {
+                Ok(bytes) if bytes.len() as u64 == chunk.size => bytes,
+                _ => fetch_from_sources(&chunk, &sources, retries, &metrics).await?,
             };
             store.put_chunk(&chunk.hash, &bytes)?;
             Ok::<_, anyhow::Error>(())
