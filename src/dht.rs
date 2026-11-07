@@ -68,11 +68,21 @@ impl Dht {
             providers: HashMap::new(),
         }
     }
-    pub fn add_peer(&mut self, peer: Peer) {
+    pub fn add_peer(&mut self, mut peer: Peer) {
         if let Some(index) = bucket_index(&self.local_id, &peer.id) {
             let bucket = &mut self.buckets[index];
             if let Some(position) = bucket.iter().position(|existing| existing.id == peer.id) {
-                bucket.remove(position);
+                if let Some(existing) = bucket.remove(position) {
+                    if peer.relay.is_none() {
+                        peer.relay = existing.relay;
+                    }
+                    if peer.alternate_relays.is_empty() {
+                        peer.alternate_relays = existing.alternate_relays;
+                    }
+                    if peer.capacity_bytes == 0 {
+                        peer.capacity_bytes = existing.capacity_bytes;
+                    }
+                }
             } else if bucket.len() == self.k {
                 bucket.pop_front();
             }
@@ -208,5 +218,17 @@ mod tests {
         d.add_peer(recent.clone());
         assert!(d.peer(&old.id).is_none());
         assert_eq!(d.peer(&recent.id), Some(recent));
+    }
+
+    #[test]
+    fn bootstrap_refresh_preserves_saved_relay_routes() {
+        let mut d = Dht::new([0; 32], 2);
+        let address = "127.0.0.1:7401".parse().unwrap();
+        let mut saved = Peer::from_address(address, 100);
+        saved.relay = Some("127.0.0.1:7501".parse().unwrap());
+        saved.alternate_relays = vec!["127.0.0.1:7502".parse().unwrap()];
+        d.add_peer(saved.clone());
+        d.add_peer(Peer::from_address(address, 0));
+        assert_eq!(d.peer(&saved.id), Some(saved));
     }
 }
