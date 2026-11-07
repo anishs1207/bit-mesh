@@ -117,9 +117,11 @@ repair if the uploader is offline, provided a paid replacement is configured.
   contacts from seeds, probe providers in parallel, prioritize rare chunks, and
   rank peers by observed speed, failures, and current requests.
 - A node can use `serve --relay RELAY_ADDRESS --peers RELAY_ADDRESS` to maintain
-  an outbound tunnel to a publicly reachable relay node. Requests try the direct
-  address first and then the tunnel. This works for nodes that cannot accept
-  inbound connections; automatic hole punching is not implemented.
+  an outbound tunnel to a publicly reachable relay node. Supply multiple relay
+  addresses with `--relay RELAY_A,RELAY_B` to keep independent tunnels and fail
+  over if one relay becomes unreachable. Requests try the direct address and
+  then each relay in order. This works for nodes that cannot accept inbound
+  connections; automatic hole punching is not implemented.
 - Writes are atomic and serialized for quota accounting. Content IDs are strictly
   validated, and corrupt local or remote bytes are rejected.
 - The JSON-over-TCP protocol is intentionally small. Internet deployment still

@@ -111,8 +111,8 @@ enum Command {
         listen: SocketAddr,
         #[arg(long, value_delimiter = ',')]
         peers: Vec<SocketAddr>,
-        #[arg(long)]
-        relay: Option<SocketAddr>,
+        #[arg(long, value_delimiter = ',')]
+        relay: Vec<SocketAddr>,
         #[arg(long)]
         solana_rpc: Option<String>,
         #[arg(long)]
@@ -297,7 +297,7 @@ async fn main() -> Result<()> {
                 });
             }
             println!("bitmesh node listening on {listen}");
-            network::serve_configured(listen, store, 128, &peers, relay, payment).await
+            network::serve_configured_with_relays(listen, store, 128, &peers, &relay, payment).await
         }
         Command::Prepare { file, chunk_size } => {
             let manifest = Manifest::from_file_with(&file, chunk_size, |reference, bytes| {
@@ -1098,7 +1098,10 @@ async fn discover_peers(key: &str, seeds: &[SocketAddr]) -> Vec<Peer> {
                         known
                             .entry(peer.id)
                             .and_modify(|existing| {
-                                if existing.relay.is_none() && peer.relay.is_some() {
+                                if (existing.relay.is_none() && peer.relay.is_some())
+                                    || (existing.alternate_relays.is_empty()
+                                        && !peer.alternate_relays.is_empty())
+                                {
                                     *existing = peer.clone();
                                 }
                             })

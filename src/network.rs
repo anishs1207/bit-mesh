@@ -104,20 +104,27 @@ pub async fn request(addr: SocketAddr, request: Request) -> Result<Response> {
 pub async fn request_peer(peer: &Peer, request: Request) -> Result<Response> {
     match self::request(peer.address, request.clone()).await {
         Ok(response) => Ok(response),
-        Err(direct_error) => match peer.relay {
-            Some(relay) => self::request(
-                relay,
-                Request::Relay {
-                    target: peer.id,
-                    request: Box::new(request),
-                },
-            )
-            .await
-            .with_context(|| {
-                format!("direct connection failed: {direct_error}; relay {relay} failed")
-            }),
-            None => Err(direct_error),
-        },
+        Err(direct_error) => {
+            let mut last_error = direct_error;
+            for relay in peer.relay.iter().chain(peer.alternate_relays.iter()) {
+                match self::request(
+                    *relay,
+                    Request::Relay {
+                        target: peer.id,
+                        request: Box::new(request.clone()),
+                    },
+                )
+                .await
+                {
+                    Ok(Response::Error(error)) => {
+                        last_error = anyhow::anyhow!("relay {relay}: {error}");
+                    }
+                    Ok(response) => return Ok(response),
+                    Err(error) => last_error = error.context(format!("relay {relay} failed")),
+                }
+            }
+            Err(last_error).context("direct connection and relay routes failed")
+        }
     }
 }
 
@@ -178,9 +185,22 @@ pub async fn serve_configured(
     relay: Option<SocketAddr>,
     payment: Option<PaymentConfig>,
 ) -> Result<()> {
+    let relays: Vec<_> = relay.into_iter().collect();
+    serve_configured_with_relays(addr, store, max_connections, bootstrap, &relays, payment).await
+}
+
+pub async fn serve_configured_with_relays(
+    addr: SocketAddr,
+    store: Store,
+    max_connections: usize,
+    bootstrap: &[SocketAddr],
+    relays: &[SocketAddr],
+    payment: Option<PaymentConfig>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let mut local = Peer::from_address(addr, store.quota());
-    local.relay = relay;
+    local.relay = relays.first().copied();
+    local.alternate_relays = relays.iter().skip(1).copied().collect();
     let mut routing = Dht::new(local.id, 20);
     for peer in store.routing_peers()? {
         if peer.id == Peer::from_address(peer.address, 0).id {
@@ -192,7 +212,7 @@ pub async fn serve_configured(
     }
     let dht = Arc::new(Mutex::new(routing));
     let tunnels: Tunnels = Arc::new(Mutex::new(HashMap::new()));
-    if let Some(relay_address) = relay {
+    for &relay_address in relays {
         let local_endpoint = if addr.ip().is_unspecified() {
             SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -580,6 +600,62 @@ mod tests {
                 request: Box::new(Request::GetChunk(id.clone())),
             }).await, Ok(Response::Chunk(found)) if found == bytes)
             {
+                received = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(received);
+        node_task.abort();
+        relay_task.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn alternate_relay_recovers_unreachable_peer() {
+        let root =
+            std::env::temp_dir().join(format!("bitmesh-relay-failover-{}", std::process::id()));
+        let unused = || {
+            let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let dead_relay = unused();
+        let live_relay = unused();
+        let node = unused();
+        let unreachable = unused();
+        let relay_store = Store::open(root.join("relay"), 1024).unwrap();
+        let node_store = Store::open(root.join("node"), 1024).unwrap();
+        let bytes = b"alternate route";
+        let id = hash_bytes(bytes);
+        node_store.put_chunk(&id, bytes).unwrap();
+        let relay_task = tokio::spawn(serve(live_relay, relay_store, 8));
+        for _ in 0..50 {
+            if matches!(request(live_relay, Request::Ping).await, Ok(Response::Pong)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let node_task = tokio::spawn(async move {
+            serve_configured_with_relays(
+                node,
+                node_store,
+                8,
+                &[live_relay],
+                &[dead_relay, live_relay],
+                None,
+            )
+            .await
+        });
+        let mut peer = Peer::from_address(unreachable, 1024);
+        peer.id = Peer::from_address(node, 1024).id;
+        peer.relay = Some(dead_relay);
+        peer.alternate_relays.push(live_relay);
+        let mut received = false;
+        for _ in 0..100 {
+            if matches!(
+                request_peer(&peer, Request::GetChunk(id.clone())).await,
+                Ok(Response::Chunk(found)) if found == bytes
+            ) {
                 received = true;
                 break;
             }

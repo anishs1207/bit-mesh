@@ -13,6 +13,8 @@ pub struct Peer {
     pub id: NodeId,
     pub address: SocketAddr,
     pub relay: Option<SocketAddr>,
+    #[serde(default)]
+    pub alternate_relays: Vec<SocketAddr>,
     pub capacity_bytes: u64,
 }
 
@@ -22,6 +24,7 @@ impl Peer {
             id: sha2_bytes(address.to_string().as_bytes()),
             address,
             relay: None,
+            alternate_relays: Vec::new(),
             capacity_bytes,
         }
     }
